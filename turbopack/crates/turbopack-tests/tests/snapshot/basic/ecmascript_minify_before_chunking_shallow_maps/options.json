@@ -1,0 +1,10 @@
+{
+  "runtime": "NodeJs",
+  "entry": "../ecmascript_minify_before_chunking/input/index.js",
+  "minifyType": {
+    "Minify": {
+      "mangle": "optimal-size"
+    }
+  },
+  "generateShallowSourceMaps": true
+}
