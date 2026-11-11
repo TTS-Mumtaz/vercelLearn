@@ -1469,7 +1469,7 @@ export default async function build(
       )
 
       const proxyDetectionRegExp = new RegExp(
-        `^${PROXY_FILENAME}\\.(?:${config.pageExtensions.join('|')})$`
+        `^${PROXY_FILENAME}\\.(?:${[...config.pageExtensions, 'go'].join('|')})$`
       )
 
       const instrumentationHookDetectionRegExp = new RegExp(
@@ -1506,6 +1506,10 @@ export default async function build(
           middlewareFilePath = rootPath
         }
         if (isAtConventionLevel && fileBaseName === PROXY_FILENAME) {
+          if (proxyFilePath)
+            throw new Error(
+              `Multiple Proxy files detected: ".${normalizePathSep(proxyFilePath)}" and ".${normalizePathSep(rootPath)}". Remove one of these files; Next.js supports a single Proxy file.`
+            )
           proxyFilePath = rootPath
         }
         if (

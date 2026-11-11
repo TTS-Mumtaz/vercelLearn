@@ -1626,13 +1626,19 @@ export default class NextNodeServer extends BaseServer<
 
         if (this.dev || functionsConfig?.functions?.['/_middleware']) {
           // if used with top level await, this will be a promise
-          return require(
+          const middleware = require(
             join(
               /* turbopackIgnore: true */ this.distDir,
               'server',
               'middleware.js'
             )
           )
+          if (middleware.nativeEntry && !this.dev && !middleware.config) {
+            middleware.config = {
+              matchers: functionsConfig.functions['/_middleware']?.matchers,
+            }
+          }
+          return middleware
         }
       } catch (err) {
         if (
@@ -1782,7 +1788,15 @@ export default class NextNodeServer extends BaseServer<
         throw new MiddlewareNotFoundError()
       }
       const adapterFn: typeof import('./web/adapter').adapter =
-        middlewareModule.default || middlewareModule
+        middlewareModule.nativeEntry
+          ? (require('./web/adapter') as typeof import('./web/adapter')).adapter
+          : middlewareModule.default || middlewareModule
+
+      if (middlewareModule.nativeEntry && !this.nativeProxy) {
+        const { NativeRouteManager } =
+          require('./lib/native-route.external') as typeof import('./lib/native-route.external')
+        this.nativeProxy = new NativeRouteManager(this.distDir, this.dev)
+      }
 
       const hasRequestBody =
         !['HEAD', 'GET'].includes(params.request.method) &&
@@ -1793,7 +1807,17 @@ export default class NextNodeServer extends BaseServer<
         // `handleRequest` span, so the middleware span (and the trace context
         // it forwards to the render) stays in the request's trace.
         result = await adapterFn({
+          skipProxyUrlNormalize: middlewareModule.nativeEntry
+            ? (this.nextConfig.skipProxyUrlNormalize ?? false)
+            : undefined,
           handler:
+            (middlewareModule.nativeEntry
+              ? (request: Request) =>
+                  this.nativeProxy!.invokeMiddleware(
+                    middlewareModule.nativeEntry,
+                    request
+                  )
+              : undefined) ||
             middlewareModule.proxy ||
             middlewareModule.middleware ||
             middlewareModule,
@@ -2258,9 +2282,11 @@ export default class NextNodeServer extends BaseServer<
   private nativeRoutePages: ReadonlySet<string> | undefined = undefined
 
   private nativeRoutes: NativeRouteManager | undefined = undefined
+  private nativeProxy: NativeRouteManager | undefined = undefined
 
   async close(): Promise<void> {
     await this.nativeRoutes?.close()
+    await this.nativeProxy?.close()
     await this.cleanupListeners.runAll()
   }
 

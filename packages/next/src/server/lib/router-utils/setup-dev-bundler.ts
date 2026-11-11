@@ -567,6 +567,10 @@ async function startWatcher(
           middlewareFilePath = fileName
         }
         if (isAtConventionLevel && fileBaseName === PROXY_FILENAME) {
+          if (proxyFilePath)
+            throw new Error(
+              `Multiple Proxy files detected: "./${normalizePathSep(path.relative(dir, proxyFilePath))}" and "./${normalizePathSep(path.relative(dir, fileName))}". Remove one of these files; Next.js supports a single Proxy file.`
+            )
           proxyFilePath = fileName
         }
 
@@ -621,7 +625,8 @@ async function startWatcher(
 
         const fileExists = fs.existsSync(fileName)
         if (
-          !validFileMatcher.isPageFile(fileName) ||
+          (!validFileMatcher.isPageFile(fileName) &&
+            !(isAtConventionLevel && fileBase === 'proxy.go')) ||
           (meta?.accuracy === undefined && !fileExists)
         ) {
           continue
@@ -651,7 +656,8 @@ async function startWatcher(
 
         const rootFile = absolutePathToPage(fileName, {
           dir: dir,
-          extensions: nextConfig.pageExtensions,
+          extensions:
+            fileBase === 'proxy.go' ? ['go'] : nextConfig.pageExtensions,
           keepIndex: false,
           pagesType: PAGE_TYPES.ROOT,
         })
