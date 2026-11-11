@@ -38,6 +38,7 @@ smallvec = { workspace = true }
 thread_local = { workspace = true }
 tracing = { workspace = true }
 turbo-bitset = { workspace = true }
+turbo-concurrent-slice = { workspace = true }
 xxhash-rust = { workspace = true }
 
 # Compression is skipped under Miri.

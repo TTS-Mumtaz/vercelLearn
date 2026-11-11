@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tracing::span::EnteredSpan;
 use turbo_bitset::Bitset;
+use turbo_concurrent_slice::ConcurrentSlice;
 
 pub use crate::compaction::selector::CompactConfig;
 #[cfg(feature = "mmap")]
@@ -39,7 +40,6 @@ use crate::{
     arc_bytes::ArcBytes,
     compaction::selector::{Compactable, MergeJob, plan_compaction},
     compression::{Compression, checksum_block, decompress_into_arc},
-    concurrent_slice::ConcurrentSlice,
     constants::{
         DATA_THRESHOLD_PER_COMPACTED_FILE, KEY_BLOCK_AVG_SIZE, KEY_BLOCK_CACHE_SIZE,
         MAX_ENTRIES_PER_COMPACTED_FILE, VALUE_BLOCK_AVG_SIZE, VALUE_BLOCK_CACHE_SIZE,
@@ -2502,7 +2502,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
             target_chunk_count,
         );
         let mut results: Vec<Option<ArcBytes>> = vec![None; keys.len()];
-        let results_writer = ConcurrentSlice::new(&mut results);
+        let results_writer = ConcurrentSlice::new(results.as_mut_slice());
         let lookup_chunk = |chunk: &mut BatchGetChunk<'_>| {
             self.batch_get_chunk(
                 inner,
@@ -2543,7 +2543,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
         family: usize,
         keys: &[K],
         chunk: &mut BatchGetChunk<'_>,
-        results: &ConcurrentSlice<'_, Option<ArcBytes>>,
+        results: &ConcurrentSlice<&mut [Option<ArcBytes>]>,
         key_block_cache: &BlockCache,
         value_block_cache: &BlockCache,
     ) -> Result<()> {
