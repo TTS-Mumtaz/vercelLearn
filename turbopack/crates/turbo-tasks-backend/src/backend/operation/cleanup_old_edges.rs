@@ -85,7 +85,7 @@ pub fn capture_all_edges(task: &TaskGuard<'_>) -> Vec<OutdatedEdge> {
                 },
             }),
     );
-    old_edges.extend(task.iter_cell_dependents_keyed().map(|(entry, key)| {
+    old_edges.extend(task.iter_keyed_cell_dependents().map(|(entry, key)| {
         OutdatedEdge::KeyedCellDependency {
             dependent: entry.task,
             cell: CellRef {
@@ -175,6 +175,9 @@ fn cleanup_old_edges_inner(
                 let parent_is_transient = task_id.is_transient();
                 let mut removed_durable = SmallVec::<[TaskId; 4]>::new();
                 let mut removed_transient = SmallVec::<[TaskId; 4]>::new();
+                // Removals scan a flat set: switch a large one to a hash table first. The task's
+                // completion (or deletion) follows, which flattens (or drops) it again.
+                task.children_inflate();
                 children.retain(|child_id| {
                     if task.remove_children(child_id) {
                         if parent_is_transient || child_id.is_transient() {
@@ -264,6 +267,9 @@ fn cleanup_old_edges_inner(
             OutdatedEdge::CellDependency { dependent, cell } => {
                 {
                     let mut task = ctx.task(cell.task, TaskDataCategory::Data);
+                    // A widely read cell has many dependents, which lose their edges one at a
+                    // time: removals scan a flat set, so switch a large one to a hash table.
+                    task.cell_dependents_inflate();
                     task.remove_cell_dependents(&CellRef {
                         task: dependent,
                         cell: cell.cell,
@@ -271,6 +277,12 @@ fn cleanup_old_edges_inner(
                 }
                 {
                     let mut task = ctx.task(dependent, TaskDataCategory::Data);
+                    if dependent == task_id {
+                        // Removing a batch from this task's own set, which its completion (or
+                        // deletion) flattens (or drops) again. Not done for another task's set
+                        // (when deleting edges into this task), that would stay a hash table.
+                        task.cell_dependencies_inflate();
+                    }
                     task.remove_cell_dependencies(&cell);
                     task.remove_outdated_cell_dependencies(&cell);
                 }
@@ -283,7 +295,7 @@ fn cleanup_old_edges_inner(
                 // Same as above but in the `_keyed` sets.
                 {
                     let mut task = ctx.task(cell.task, TaskDataCategory::Data);
-                    task.remove_cell_dependents_keyed(&(
+                    task.remove_keyed_cell_dependent(&(
                         CellRef {
                             task: dependent,
                             cell: cell.cell,
@@ -293,6 +305,9 @@ fn cleanup_old_edges_inner(
                 }
                 {
                     let mut task = ctx.task(dependent, TaskDataCategory::Data);
+                    if dependent == task_id {
+                        task.cell_dependencies_keyed_inflate();
+                    }
                     task.remove_cell_dependencies_keyed(&(cell, key));
                     task.remove_outdated_cell_dependencies_keyed(&(cell, key));
                 }
@@ -310,10 +325,14 @@ fn cleanup_old_edges_inner(
                 .entered();
                 {
                     let mut task = ctx.task(output_task, TaskDataCategory::Data);
+                    task.output_dependent_inflate();
                     task.remove_output_dependent(&dependent);
                 }
                 {
                     let mut task = ctx.task(dependent, TaskDataCategory::Data);
+                    if dependent == task_id {
+                        task.output_dependencies_inflate();
+                    }
                     task.remove_output_dependencies(&output_task);
                     task.remove_outdated_output_dependencies(&output_task);
                 }
@@ -328,6 +347,7 @@ fn cleanup_old_edges_inner(
                 }
                 {
                     let mut task = ctx.task(task_id, TaskDataCategory::Data);
+                    task.collectibles_dependencies_inflate();
                     task.remove_collectibles_dependencies(&CollectiblesRef {
                         collectible_type,
                         task: dependent_task_id,
