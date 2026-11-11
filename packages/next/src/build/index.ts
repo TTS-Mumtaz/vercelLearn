@@ -3571,7 +3571,7 @@ export default async function build(
             // nonJsBots has been converted to a string during loadConfig. The
             // configured pattern replaces the default non-JS bot pattern.
             const nonJsBotsBypassRegexString = `.*(?:${getNonJsBotsPattern(
-              config.experimental.nonJsBots
+              config.nonJsBots
             )}).*`
 
             // this flag is used to selectively bypass the static cache and invoke the lambda directly

@@ -221,10 +221,6 @@ export const conditions: Record<string, Condition> = {
     'the concurrent router queue fork is enabled',
     (config) => config.experimental?.concurrentRouterQueue
   ),
-  disableProgressiveLoadingForNonJsBots: lazyCondition(
-    'progressive loading is disabled for non-JS bots',
-    (config) => config.experimental?.disableProgressiveLoadingForNonJsBots
-  ),
   dynamicOnHover: lazyCondition(
     'dynamic prefetches are triggered on hover',
     (config) => config.experimental?.dynamicOnHover

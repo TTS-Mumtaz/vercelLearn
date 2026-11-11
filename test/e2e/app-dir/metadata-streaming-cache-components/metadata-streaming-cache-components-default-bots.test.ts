@@ -252,10 +252,7 @@ function expectOptionalCatchallParams(html: string) {
         await assertNoConsoleErrors(browser)
       })
 
-      // @gate disableProgressiveLoadingForNonJsBots
       it('sends no hidden content to non-JS bots', async () => {
-        // The fixture does not set the flag itself; the Cache Components shard
-        // enables it via config defaulting (__NEXT_CACHE_COMPONENTS).
         const res = await next.fetch('/large-boundary', {
           headers: {
             'user-agent':

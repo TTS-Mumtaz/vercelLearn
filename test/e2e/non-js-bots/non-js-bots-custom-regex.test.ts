@@ -12,10 +12,7 @@ describe('non-js-bots custom regex', () => {
     overrideFiles: {
       'next.config.js': `
         module.exports = {
-          experimental: {
-            disableProgressiveLoadingForNonJsBots: true,
-            nonJsBots: /Minibot/i,
-          },
+          nonJsBots: /Minibot/i,
         }
       `,
     },
