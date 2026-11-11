@@ -95,6 +95,7 @@ async function exportPageImpl(
     deploymentId,
     clientAssetToken,
     renderResumeDataCache,
+    routePrefetchHints,
     useScopedBuildArtifacts,
   } = input
 
@@ -325,6 +326,7 @@ async function exportPageImpl(
       isRoutePPREnabled,
     },
     renderResumeDataCache,
+    routePrefetchHints,
   }
 
   // Handle App Pages
@@ -395,6 +397,17 @@ async function exportPageImpl(
   }
 }
 
+/**
+ * The incremental cache this worker created for the export it is working on
+ * (see `exportPages`).
+ */
+let incrementalCacheOfExport:
+  | {
+      exportId: number
+      incrementalCache: ReturnType<typeof createIncrementalCache>
+    }
+  | undefined
+
 export async function exportPages(
   input: ExportPagesInput
 ): Promise<ExportPagesResult> {
@@ -416,6 +429,7 @@ export async function exportPages(
     nextConfig,
     options,
     renderResumeDataCachesByPage = {},
+    routePrefetchHintsByPage,
   } = input
 
   installGlobalBehaviors(nextConfig)
@@ -431,22 +445,36 @@ export async function exportPages(
 
   // If the fetch cache was enabled, we need to create an incremental
   // cache instance for this page.
-  const incrementalCache = await createIncrementalCache({
-    cacheHandler,
-    cacheMaxMemorySize,
-    fetchCacheKeyPrefix,
-    distDir,
-    dir,
-    // skip writing to disk in minimal mode for now, pending some
-    // changes to better support it
-    flushToDisk: !hasNextSupport,
-    cacheHandlers: nextConfig.cacheHandlers,
-  })
+  //
+  // An export hands this worker its pages in several batches. They share one
+  // incremental cache, and with it one instance of a custom cache handler,
+  // the same as when a worker got all its pages of an export in one call.
+  if (
+    incrementalCacheOfExport === undefined ||
+    incrementalCacheOfExport.exportId !== input.exportId
+  ) {
+    incrementalCacheOfExport = {
+      exportId: input.exportId,
+      incrementalCache: createIncrementalCache({
+        cacheHandler,
+        cacheMaxMemorySize,
+        fetchCacheKeyPrefix,
+        distDir,
+        dir,
+        // skip writing to disk in minimal mode for now, pending some
+        // changes to better support it
+        flushToDisk: !hasNextSupport,
+        cacheHandlers: nextConfig.cacheHandlers,
+      }),
+    }
+  }
+  const incrementalCache = await incrementalCacheOfExport.incrementalCache
 
   renderOpts.incrementalCache = incrementalCache
 
-  const maxConcurrency =
-    nextConfig.experimental.staticGenerationMaxConcurrency ?? 8
+  const maxConcurrency = input.renderOneAtATime
+    ? 1
+    : (nextConfig.experimental.staticGenerationMaxConcurrency ?? 8)
   const results: ExportPagesResult = []
 
   const exportPageWithRetry = async (
@@ -494,6 +522,7 @@ export async function exportPages(
             deploymentId: input.deploymentId,
             clientAssetToken: input.clientAssetToken,
             renderResumeDataCache,
+            routePrefetchHints: routePrefetchHintsByPage?.[page],
             useScopedBuildArtifacts:
               Boolean(nextConfig.adapterPath) &&
               nextConfig.output !== 'export' &&
