@@ -3003,6 +3003,8 @@ export default async function build(
           hasNodeMiddleware = true
           functionsConfigManifest.functions['/_middleware'] = {
             runtime: 'nodejs',
+            maxDuration: staticInfo.maxDuration,
+            regions: staticInfo.preferredRegion,
             matchers: staticInfo.middleware?.matchers ?? [
               {
                 regexp: '^.*$',

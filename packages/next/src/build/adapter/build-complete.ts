@@ -1180,6 +1180,8 @@ export async function handleBuildComplete({
           runtime: isGoProxy ? 'go' : 'nodejs',
           filePath,
           config: {
+            maxDuration: functionConfig.maxDuration,
+            preferredRegion: functionConfig.regions,
             matchers:
               functionConfig.matchers?.map((item) => {
                 return {
