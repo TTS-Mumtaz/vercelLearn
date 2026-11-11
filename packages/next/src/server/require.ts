@@ -16,6 +16,30 @@ import { promises } from 'fs'
 const isDev = process.env.NODE_ENV === 'development'
 const pagePathCache = !isDev ? new LRUCache<string | null>(1000) : null
 
+/**
+ * The modules of the pages that were loaded, by their path. `require()`
+ * returns the same module for a path until its entry in `require.cache` is
+ * deleted, which only a dev server does (to pick up a rebuilt page). Outside
+ * of a dev server this map answers without going through the module loader,
+ * which resolves the request, looks up its own cache and reports the load on
+ * every call. It holds what `require.cache` holds anyway.
+ *
+ * A dev server is not always `NODE_ENV=development`: `next dev` keeps a
+ * `NODE_ENV` it is started with (`NODE_ENV=test next dev`), so the map is also
+ * off whenever `__NEXT_DEV_SERVER` is set. That is decided on the first page
+ * load, not when this module loads, because a custom server only sets it in
+ * `prepare()`.
+ */
+let pageModuleCache: Map<string, unknown> | null | undefined
+
+function getPageModuleCache(): Map<string, unknown> | null {
+  if (pageModuleCache === undefined) {
+    pageModuleCache =
+      isDev || process.env.__NEXT_DEV_SERVER ? null : new Map<string, unknown>()
+  }
+  return pageModuleCache
+}
+
 export function getMaybePagePath(
   page: string,
   distDir: string,
@@ -126,9 +150,16 @@ export async function requirePage(
       })
   }
 
+  const moduleCache = getPageModuleCache()
+  const loaded = moduleCache?.get(pagePath)
+  if (loaded !== undefined) {
+    return loaded
+  }
+
   const mod = process.env.NEXT_MINIMAL
     ? // @ts-ignore
       __non_webpack_require__(pagePath)
     : require(/* turbopackIgnore: true */ pagePath)
+  moduleCache?.set(pagePath, mod)
   return mod
 }
