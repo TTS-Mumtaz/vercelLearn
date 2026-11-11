@@ -2116,6 +2116,7 @@ fn generate_autoset_ops(field: &FieldInfo) -> TokenStream {
     let remove_name = field.prefixed_ident("remove");
     let set_name = field.prefixed_ident("set");
     let has_name = field.suffixed_ident("contains");
+    let inflate_name = field.suffixed_ident("inflate");
     let iter_name = field.iter_ident();
     let len_name = field.len_ident();
     let is_empty_name = field.is_empty_ident();
@@ -2125,6 +2126,31 @@ fn generate_autoset_ops(field: &FieldInfo) -> TokenStream {
         quote! { #ref_expr.is_some_and(|set| set.contains(item)) }
     } else {
         quote! { #ref_expr.contains(item) }
+    };
+
+    // Only edge sets (flat arrays that can switch to a hash table) can be inflated. Doesn't change
+    // the contents, so no modification is tracked. A lazy set is found without creating it.
+    let inflate_fn = if is_edge_set(field_type) {
+        let body = if is_option {
+            let extractor = field.lazy_extractor_closure();
+            quote! {
+                if let Some((idx, _)) = self.typed().find_lazy_ref(#extractor) {
+                    self.typed_mut().lazy_at_mut(idx, #extractor).inflate();
+                }
+            }
+        } else {
+            quote! { #mut_expr.inflate() }
+        };
+        quote! {
+            #[doc = "Switches a large set to a hash table, for a run of lookups and removals. The"]
+            #[doc = "contents don't change, so no modification is tracked."]
+            fn #inflate_name(&mut self) {
+                #check_access
+                #body
+            }
+        }
+    } else {
+        quote! {}
     };
 
     let iter_body = if is_option {
@@ -2333,6 +2359,8 @@ fn generate_autoset_ops(field: &FieldInfo) -> TokenStream {
             #check_access
             #has_body
         }
+
+        #inflate_fn
 
         #[doc = "Add an item to the set."]
         #[doc = "Returns true if the item was newly added, false if it already existed."]
@@ -3420,11 +3448,26 @@ fn extract_option_inner_type(ty: &Type) -> TokenStream {
     quote! { #ty }
 }
 
-/// Extract the element type `K` from `AutoSet<K>` (which is `FxHashSet<K>`)
+/// Whether the field type is a `ForwardEdgeSet<K>` or `ReverseEdgeSet<K>`.
+fn is_edge_set(ty: &Type) -> bool {
+    if let Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        segment.ident == "ForwardEdgeSet" || segment.ident == "ReverseEdgeSet"
+    } else {
+        false
+    }
+}
+
+/// Extract the element type `K` from `AutoSet<K>` (which is `FxHashSet<K>`), `ForwardEdgeSet<K>`
+/// or `ReverseEdgeSet<K>`
 fn extract_set_element_type(ty: &Type) -> Option<TokenStream> {
     if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.last()
-        && (segment.ident == "AutoSet" || segment.ident == "FxHashSet")
+        && (segment.ident == "AutoSet"
+            || segment.ident == "FxHashSet"
+            || segment.ident == "ForwardEdgeSet"
+            || segment.ident == "ReverseEdgeSet")
         && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
         && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
     {

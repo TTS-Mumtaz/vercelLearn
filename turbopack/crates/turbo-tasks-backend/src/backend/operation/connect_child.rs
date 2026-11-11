@@ -50,6 +50,10 @@ pub fn connect_child(
             return;
         }
 
+        // `children` is still the previous execution's set, which completion flattened. The parent
+        // looks up every child it connects, so switch it to a hash table (no-op for small sets and
+        // after the first time); completion flattens it again.
+        parent_task.children_inflate();
         if parent_task.children_contains(&child_task_id) {
             // It is already connected, we can skip the rest
             // but we still need to update the new_children set
