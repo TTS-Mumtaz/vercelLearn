@@ -252,6 +252,24 @@ function expectOptionalCatchallParams(html: string) {
         await assertNoConsoleErrors(browser)
       })
 
+      // @gate disableProgressiveLoadingForNonJsBots
+      it('sends no hidden content to non-JS bots', async () => {
+        // The fixture does not set the flag itself; the Cache Components shard
+        // enables it via config defaulting (__NEXT_CACHE_COMPONENTS).
+        const res = await next.fetch('/large-boundary', {
+          headers: {
+            'user-agent':
+              'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)',
+          },
+        })
+
+        const html = await res.text()
+        expect(html).not.toMatch(/<div hidden id="S:/)
+        expect(html).not.toContain('$RC(')
+        expect(html).toContain('large-boundary-start')
+        expect(html).toContain('large-boundary-end')
+      })
+
       it('should not yield hydration errors after revalidation', async () => {
         const browser = await next.browser('/partially-static', {
           pushErrorAsConsoleLog: true,
