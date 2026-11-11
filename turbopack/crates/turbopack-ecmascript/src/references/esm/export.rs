@@ -2,7 +2,6 @@ use std::{collections::BTreeMap, ops::ControlFlow};
 
 use anyhow::{Result, bail};
 use bincode::{Decode, Encode};
-use indexmap::map::Entry;
 use rustc_hash::FxHashSet;
 use swc_core::{
     common::{DUMMY_SP, Span, SyntaxContext},
@@ -14,7 +13,9 @@ use swc_core::{
 };
 use turbo_frozenmap::FrozenMap;
 use turbo_rcstr::{RcStr, rcstr};
-use turbo_tasks::{FxIndexMap, NonLocalValue, ResolvedVc, TryFlatJoinIterExt, Vc, turbofmt};
+use turbo_tasks::{
+    FxIndexMap, NonLocalValue, OrderedAutoMap, ResolvedVc, TryFlatJoinIterExt, Vc, turbofmt,
+};
 use turbopack_core::{
     chunk::{ChunkingContext, ModuleChunkItemIdExt},
     ident::AssetIdent,
@@ -350,8 +351,7 @@ async fn find_export_from_reexports(
 #[turbo_tasks::value]
 struct AllExportNamesResult {
     /// A map from export name to how each export is defined.
-    #[bincode(with = "turbo_bincode::indexmap")]
-    esm_exports: FxIndexMap<RcStr, EsmExport>,
+    esm_exports: OrderedAutoMap<RcStr, EsmExport>,
     /// A list of all direct or indirectly referenced modules that are dynamically exporting
     dynamic_exporting_modules: Vec<ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>>,
 }
@@ -363,14 +363,14 @@ async fn get_all_export_names(
     let exports = module.get_exports().await?;
     let EcmascriptExports::EsmExports(exports) = &*exports else {
         return Ok(AllExportNamesResult {
-            esm_exports: FxIndexMap::default(),
+            esm_exports: OrderedAutoMap::default(),
             dynamic_exporting_modules: vec![module],
         }
         .cell());
     };
 
     let exports = exports.await?;
-    let mut esm_exports = FxIndexMap::default();
+    let mut esm_exports = OrderedAutoMap::default();
     let mut dynamic_exporting_modules = Vec::new();
     esm_exports.extend(
         exports
@@ -415,8 +415,7 @@ async fn get_all_export_names(
 
 #[turbo_tasks::value]
 pub struct ExpandStarResult {
-    #[bincode(with = "turbo_bincode::indexmap")]
-    pub esm_exports: FxIndexMap<RcStr, EsmExport>,
+    pub esm_exports: OrderedAutoMap<RcStr, EsmExport>,
     pub dynamic_exporting_modules: Vec<ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>>,
 }
 
@@ -425,7 +424,7 @@ pub async fn expand_star_exports(
     root_reference: ResolvedVc<Box<dyn ModuleReference>>,
     root_module: ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>,
 ) -> Result<Vc<ExpandStarResult>> {
-    let mut esm_exports = FxIndexMap::default();
+    let mut esm_exports = OrderedAutoMap::default();
     let mut dynamic_exporting_modules = Vec::new();
     let mut checked_modules = FxHashSet::default();
     checked_modules.insert(root_module);
@@ -438,8 +437,9 @@ pub async fn expand_star_exports(
                     if key == "default" {
                         continue;
                     }
-                    if let Entry::Vacant(entry) = esm_exports.entry(key.clone()) {
-                        entry.insert(match esm_export {
+                    esm_exports
+                        .entry(key.clone())
+                        .or_insert_with(|| match esm_export {
                             EsmExport::LocalBinding(_, liveness) => EsmExport::ImportedBinding(
                                 reference,
                                 key.clone(),
@@ -447,7 +447,6 @@ pub async fn expand_star_exports(
                             ),
                             _ => esm_export.clone(),
                         });
-                    }
                 }
                 for esm_ref in exports.star_exports.iter() {
                     if let ReferencedAsset::Some(asset) =
