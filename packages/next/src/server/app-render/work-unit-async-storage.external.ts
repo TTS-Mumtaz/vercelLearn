@@ -58,7 +58,25 @@ export interface RequestStore extends CommonWorkUnitStore {
   // The cookie object itself is deliberately read only and thus can't be updated.
   cookies: ReadonlyRequestCookies
   readonly mutableCookies: ResponseCookies
+  /**
+   * Returns `true` when `mutableCookies` is known to hold no modified cookies.
+   * It does not create `mutableCookies` to find out; when it returns `false`,
+   * read `mutableCookies` to get them.
+   */
+  readonly hasNoModifiedCookies?: () => boolean
   readonly userspaceMutableCookies: ResponseCookies
+  /**
+   * The promise `headers()` returns for this store's `headers`, and the
+   * promise `cookies()` returns for one of this store's cookies objects: the
+   * same promise for the same object. A store that implements these keeps the
+   * promises itself. For any other store, and for a cookies object that is
+   * not the store's own (`undefined`), the request APIs keep the promise in a
+   * cache that is keyed by the object.
+   */
+  readonly headersPromise?: () => Promise<ReadonlyHeaders>
+  readonly cookiesPromise?: (
+    underlyingCookies: ReadonlyRequestCookies
+  ) => Promise<ReadonlyRequestCookies> | undefined
   readonly draftMode: DraftModeProvider
   readonly isHmrRefresh?: boolean
   readonly serverComponentsHmrCache?: ServerComponentsHmrCache
