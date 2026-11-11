@@ -260,7 +260,10 @@ impl TurboBackingStorage {
         let _span = tracing::info_span!("save snapshot").entered();
         let batch = self.inner.database.write_batch()?;
 
-        {
+        // Persisting fans out into many (nested) parallel sections and runs on a runtime worker.
+        // Wait by parking rather than handing workers off to the blocking pool, which would grow
+        // it by one idle thread per hand-off.
+        parallel::without_block_in_place(|| {
             let span = tracing::trace_span!("update task data");
             let mut snapshot_meta =
                 parallel::map_collect_owned::<_, _, Result<Vec<_>>>(snapshots, |shard: I| {
@@ -363,7 +366,7 @@ impl TurboBackingStorage {
                 snapshot_meta.bytes_deleted = stats.bytes_deleted;
             }
             Ok(snapshot_meta)
-        }
+        })
     }
 
     pub(crate) fn lookup_task_candidates(
@@ -499,7 +502,11 @@ pub fn decode_task_storage_batch(
         Ok(Some(storage))
     };
     if bytes.len() >= parallel_threshold {
-        parallel::map_collect::<_, _, Result<Vec<_>>>(bytes, decode)
+        // Called from task execution on runtime workers: keep the worker instead of handing it off
+        // to the blocking pool while waiting for the decode jobs.
+        parallel::without_block_in_place(|| {
+            parallel::map_collect::<_, _, Result<Vec<_>>>(bytes, decode)
+        })
     } else {
         bytes.iter().map(decode).collect()
     }
