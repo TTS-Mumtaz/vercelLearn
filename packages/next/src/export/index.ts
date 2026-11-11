@@ -77,9 +77,113 @@ import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
 import type { Params } from '../server/request/params'
 import { Bundler } from '../lib/bundler'
 import { getBuildDistDir, getExportPathPageKey } from './utils'
+import { compareRouteSegments } from '../shared/lib/router/utils/sortable-routes'
+import type { PrefetchHints } from '../shared/lib/app-router-types'
+
+/**
+ * How many batches of pages each static generation worker gets when there are
+ * enough pages to split. More batches even out the load between workers at
+ * the end of the export; each batch costs one worker call.
+ */
+const EXPORT_BATCHES_PER_WORKER = 32
+
+/**
+ * Counts the exports started by this process. The batches of one export carry
+ * its number, so that a worker can tell them from the batches of another one.
+ */
+let exportCount = 0
 
 export class ExportError extends Error {
   code = 'NEXT_EXPORT_ERROR'
+}
+
+/**
+ * Whether the export path is an App Router page with all of its params known.
+ * These are the paths whose prefetch hints the build records for their route
+ * in prefetch-hints.json (it prefers them over fallback shells).
+ */
+function isConcreteAppPagePath(exportPath: ExportPathEntry): boolean {
+  return (
+    exportPath._isAppDir === true &&
+    !isAppRouteRoute(exportPath.page) &&
+    !(
+      exportPath._fallbackRouteParams &&
+      exportPath._fallbackRouteParams.length > 0
+    )
+  )
+}
+
+/**
+ * The inlining decisions in a route's prefetch hints are made once, by one of
+ * its pages, and the route's other pages are built with the same ones. This
+ * returns the path that decides for each route with more than one concrete
+ * path: the first one in route order, which is the one whose hints the build
+ * records in prefetch-hints.json.
+ */
+function getPrefetchHintDecidingPaths(
+  exportPaths: ExportPathEntry[]
+): Set<ExportPathEntry> {
+  const firstPathByPage = new Map<string, ExportPathEntry>()
+  const pagesWithSeveralPaths = new Set<string>()
+  for (const exportPath of exportPaths) {
+    if (!isConcreteAppPagePath(exportPath)) {
+      continue
+    }
+    const firstPath = firstPathByPage.get(exportPath.page)
+    if (firstPath === undefined) {
+      firstPathByPage.set(exportPath.page, exportPath)
+      continue
+    }
+    pagesWithSeveralPaths.add(exportPath.page)
+    if (compareRouteSegments(exportPath.path, firstPath.path) < 0) {
+      firstPathByPage.set(exportPath.page, exportPath)
+    }
+  }
+
+  const decidingPaths = new Set<ExportPathEntry>()
+  for (const page of pagesWithSeveralPaths) {
+    decidingPaths.add(firstPathByPage.get(page)!)
+  }
+  return decidingPaths
+}
+
+/**
+ * Adds the prefetch hints of each route that has no entry yet: those of its
+ * first concrete path (in route order) that was prerendered with hints.
+ * `results` are the results of `exportPaths`, in the same order.
+ */
+function collectRoutePrefetchHints(
+  exportPaths: ExportPathEntry[],
+  results: ExportPagesResult,
+  routePrefetchHintsByPage: Record<string, PrefetchHints>
+): void {
+  const firstByPage = new Map<string, { path: string; hints: PrefetchHints }>()
+  for (let i = 0; i < exportPaths.length; i++) {
+    const exportPath = exportPaths[i]
+    const result = results[i]?.result
+    if (
+      !result ||
+      'error' in result ||
+      !isConcreteAppPagePath(exportPath) ||
+      Object.hasOwn(routePrefetchHintsByPage, exportPath.page)
+    ) {
+      continue
+    }
+    const hints = result.metadata?.prefetchHints
+    if (!hints) {
+      continue
+    }
+    const first = firstByPage.get(exportPath.page)
+    if (
+      first === undefined ||
+      compareRouteSegments(exportPath.path, first.path) < 0
+    ) {
+      firstByPage.set(exportPath.page, { path: exportPath.path, hints })
+    }
+  }
+  for (const [page, { hints }] of firstByPage) {
+    routePrefetchHintsByPage[page] = hints
+  }
 }
 
 /**
@@ -694,7 +798,9 @@ async function exportAppImpl(
   const exportPagesInBatches = async (
     worker: StaticWorker,
     exportPaths: ExportPathEntry[],
-    renderResumeDataCachesByPage?: Record<string, string>
+    renderResumeDataCachesByPage?: Record<string, string>,
+    routePrefetchHintsByPage?: Record<string, PrefetchHints>,
+    renderOneAtATime: boolean = false
   ): Promise<ExportPagesResult> => {
     // Batch filtered pages into smaller batches, and call the export worker on
     // each batch. We've set a default minimum of 25 pages per batch to ensure
@@ -710,62 +816,118 @@ async function exportAppImpl(
       Math.ceil(exportPaths.length / minPageCountPerBatch)
     )
 
-    // Calculate the page count per batch based on the number of workers.
-    const pageCountPerBatch = Math.ceil(exportPaths.length / numWorkers)
+    // The page count per worker if every worker got one equal share.
+    const pageCountPerWorker = Math.ceil(exportPaths.length / numWorkers)
 
-    const batches = Array.from({ length: numWorkers }, (_, i) =>
-      exportPaths.slice(i * pageCountPerBatch, (i + 1) * pageCountPerBatch)
+    // Pages differ in cost by route, so one contiguous share per worker
+    // leaves workers idle while the most expensive share finishes. Split
+    // large shares into smaller contiguous batches instead, and deal them out
+    // to the workers in turn (see below). Batches never go below the minimum
+    // page count, and are a multiple of the in-worker concurrency so that
+    // workers keep rendering full groups of pages.
+    const maxConcurrency = Math.max(
+      1,
+      nextConfig.experimental.staticGenerationMaxConcurrency ?? 8
     )
+    let pageCountPerBatch = Math.max(
+      minPageCountPerBatch,
+      Math.ceil(exportPaths.length / (numWorkers * EXPORT_BATCHES_PER_WORKER))
+    )
+    pageCountPerBatch =
+      Math.ceil(pageCountPerBatch / maxConcurrency) * maxConcurrency
+    if (!(pageCountPerBatch < pageCountPerWorker)) {
+      pageCountPerBatch = pageCountPerWorker
+    }
 
-    // Distribute remaining pages.
-    const remainingPages = exportPaths.slice(numWorkers * pageCountPerBatch)
-    remainingPages.forEach((page, index) => {
-      batches[index % batches.length].push(page)
-    })
+    const exportId = ++exportCount
+    const batches: ExportPathEntry[][] = []
+    for (let i = 0; i < exportPaths.length; i += pageCountPerBatch) {
+      batches.push(exportPaths.slice(i, i + pageCountPerBatch))
+    }
 
-    return (
-      await Promise.all(
-        batches.map(async (batch) => {
-          // Only send the seeds this batch needs. Sending the whole map to
-          // every worker can exceed the maximum IPC message size.
-          let batchRenderResumeDataCaches: Record<string, string> | undefined
-          if (renderResumeDataCachesByPage) {
-            batchRenderResumeDataCaches = {}
-            for (const exportPath of batch) {
-              const pageKey = getExportPathPageKey(exportPath)
-              if (Object.hasOwn(renderResumeDataCachesByPage, pageKey)) {
-                batchRenderResumeDataCaches[pageKey] =
-                  renderResumeDataCachesByPage[pageKey]
-              }
-            }
+    const exportBatch = (batch: ExportPathEntry[], lane: number) => {
+      // Only send the seeds this batch needs. Sending the whole map to
+      // every worker can exceed the maximum IPC message size.
+      let batchRenderResumeDataCaches: Record<string, string> | undefined
+      if (renderResumeDataCachesByPage) {
+        batchRenderResumeDataCaches = {}
+        for (const exportPath of batch) {
+          const pageKey = getExportPathPageKey(exportPath)
+          if (Object.hasOwn(renderResumeDataCachesByPage, pageKey)) {
+            batchRenderResumeDataCaches[pageKey] =
+              renderResumeDataCachesByPage[pageKey]
           }
+        }
+      }
 
-          return worker.exportPages({
-            buildId,
-            deploymentId: nextConfig.deploymentId,
-            clientAssetToken: nextConfig.supportsImmutableAssets
-              ? ''
-              : nextConfig.deploymentId,
-            exportPaths: batch,
-            parentSpanId: span.getId(),
-            pagesDataDir,
-            renderOpts,
-            options,
-            dir,
-            distDir,
-            outDir: options.buildExport
-              ? join(distDir, 'server', 'pages')
-              : outDir,
-            nextConfig,
-            cacheHandler: nextConfig.cacheHandler,
-            cacheMaxMemorySize: nextConfig.cacheMaxMemorySize,
-            fetchCache: true,
-            fetchCacheKeyPrefix: nextConfig.experimental.fetchCacheKeyPrefix,
-            renderResumeDataCachesByPage: batchRenderResumeDataCaches,
-          })
-        })
-      )
-    ).flat()
+      // Same for the prefetch hints of the routes in this batch.
+      let batchRoutePrefetchHints: Record<string, PrefetchHints> | undefined
+      if (routePrefetchHintsByPage) {
+        for (const { page } of batch) {
+          if (Object.hasOwn(routePrefetchHintsByPage, page)) {
+            batchRoutePrefetchHints ??= {}
+            batchRoutePrefetchHints[page] = routePrefetchHintsByPage[page]
+          }
+        }
+      }
+
+      return worker.exportPages({
+        buildId,
+        deploymentId: nextConfig.deploymentId,
+        clientAssetToken: nextConfig.supportsImmutableAssets
+          ? ''
+          : nextConfig.deploymentId,
+        exportPaths: batch,
+        exportId,
+        lane,
+        parentSpanId: span.getId(),
+        pagesDataDir,
+        renderOpts,
+        options,
+        dir,
+        distDir,
+        outDir: options.buildExport ? join(distDir, 'server', 'pages') : outDir,
+        nextConfig,
+        cacheHandler: nextConfig.cacheHandler,
+        cacheMaxMemorySize: nextConfig.cacheMaxMemorySize,
+        fetchCache: true,
+        fetchCacheKeyPrefix: nextConfig.experimental.fetchCacheKeyPrefix,
+        renderResumeDataCachesByPage: batchRenderResumeDataCaches,
+        routePrefetchHintsByPage: batchRoutePrefetchHints,
+        renderOneAtATime,
+      })
+    }
+
+    // At most `numWorkers` batches are in flight, so no more workers are
+    // used than before. Results are kept in batch order, which is the order
+    // of `exportPaths`.
+    //
+    // The batches are dealt out in turn: with n workers, a worker gets every
+    // n-th batch and works through its batches in order. Pages of one route
+    // are next to each other in the export paths, so every worker gets its
+    // part of every large route and the workers finish together. Which worker
+    // renders which page depends only on the export paths and the number of
+    // workers, like before, and not on how fast each worker happens to be.
+    const results: ExportPagesResult[] = []
+    const laneCount = Math.min(numWorkers, batches.length)
+    let failed = false
+    const exportNextBatches = async (_: unknown, lane: number) => {
+      for (
+        let batchIndex = lane;
+        batchIndex < batches.length && !failed;
+        batchIndex += laneCount
+      ) {
+        try {
+          results[batchIndex] = await exportBatch(batches[batchIndex], lane)
+        } catch (err) {
+          failed = true
+          throw err
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: laneCount }, exportNextBatches))
+
+    return results.flat()
   }
 
   let initialPhaseExportPaths: ExportPathEntry[] = []
@@ -823,7 +985,69 @@ async function exportAppImpl(
       })
     }
 
-    results = await exportPagesInBatches(worker, initialPhaseExportPaths)
+    // With prefetch inlining, the inlining decisions of a route are made by
+    // one of its pages (see getPrefetchHintDecidingPaths). Export those pages
+    // first, then every other page with the decisions of its route, so that
+    // it doesn't measure its own segments to make them again.
+    const routePrefetchHintsByPage: Record<string, PrefetchHints> = {}
+    const prefetchHintDecidingPaths = nextConfig.experimental.prefetchInlining
+      ? getPrefetchHintDecidingPaths(initialPhaseExportPaths)
+      : null
+
+    if (
+      prefetchHintDecidingPaths !== null &&
+      prefetchHintDecidingPaths.size > 0
+    ) {
+      const decidingExportPaths: ExportPathEntry[] = []
+      const otherExportPaths: ExportPathEntry[] = []
+      for (const exportPath of initialPhaseExportPaths) {
+        if (prefetchHintDecidingPaths.has(exportPath)) {
+          decidingExportPaths.push(exportPath)
+        } else {
+          otherExportPaths.push(exportPath)
+        }
+      }
+
+      // With Cache Components, a worker renders these pages one at a time.
+      // They are the first pages of different routes, in a worker that has
+      // rendered nothing yet, and they read the same `use cache` entries (those
+      // of the layouts they share). Rendered together, which page generates
+      // such an entry and which pages wait for that generation depends on
+      // how long each route takes to load, and a page that waited gets the
+      // entry later in its final render than a page that generated it or
+      // found it in the cache handler: the same Flight rows in another order.
+      // One at a time, no page waits for another page's entry, as when the
+      // pages are rendered among the other pages of their route.
+      const decidingResults = await exportPagesInBatches(
+        worker,
+        decidingExportPaths,
+        undefined,
+        undefined,
+        renderOpts.cacheComponents === true
+      )
+      collectRoutePrefetchHints(
+        decidingExportPaths,
+        decidingResults,
+        routePrefetchHintsByPage
+      )
+      const otherResults = await exportPagesInBatches(
+        worker,
+        otherExportPaths,
+        undefined,
+        routePrefetchHintsByPage
+      )
+
+      // Keep the results in the order of the export paths.
+      let decidingIndex = 0
+      let otherIndex = 0
+      results = initialPhaseExportPaths.map((exportPath) =>
+        prefetchHintDecidingPaths.has(exportPath)
+          ? decidingResults[decidingIndex++]
+          : otherResults[otherIndex++]
+      )
+    } else {
+      results = await exportPagesInBatches(worker, initialPhaseExportPaths)
+    }
 
     if (finalPhaseExportPaths.length > 0) {
       const renderResumeDataCachesByPage = buildRDCCacheByPage(
@@ -831,10 +1055,22 @@ async function exportAppImpl(
         finalPhaseExportPaths
       )
 
+      if (prefetchHintDecidingPaths !== null) {
+        // A fallback shell is built with the decisions of its route too, if
+        // a concrete page of the route has made them. This adds the routes
+        // that have a single concrete page.
+        collectRoutePrefetchHints(
+          initialPhaseExportPaths,
+          results,
+          routePrefetchHintsByPage
+        )
+      }
+
       const finalPhaseResults = await exportPagesInBatches(
         worker,
         finalPhaseExportPaths,
-        renderResumeDataCachesByPage
+        renderResumeDataCachesByPage,
+        routePrefetchHintsByPage
       )
 
       results.push(...finalPhaseResults)
