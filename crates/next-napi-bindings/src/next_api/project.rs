@@ -35,6 +35,7 @@ use next_api::{
     },
     project_asset_hashes_manifest::immutable_hashes_manifest_asset_if_enabled,
     route::{Endpoint, EndpointGroupKey, Route},
+    route_bundle_stats::{OptionRouteBundleStatsFile, route_bundle_stats_file},
     routes_hashes_manifest::routes_hashes_manifest_asset_if_enabled,
     shutdown::ShutdownHooks,
 };
@@ -66,12 +67,12 @@ use turbo_tasks_backend::{BackingStorageOptions, db_invalidation::invalidation_r
 use turbo_tasks_fs::windows::to_verbatim_with_case_folded_disk;
 use turbo_tasks_fs::{
     DiskFileSystem, FileContent, FileSystem, FileSystemPath, canonicalize_to_rcstr, invalidation,
-    util::uri_from_file,
+    to_sys_path, util::uri_from_file,
 };
 use turbo_unix_path::{get_relative_path_to, unix_to_sys};
 use turbopack_core::{
     PROJECT_FILESYSTEM_NAME, SOURCE_URL_PROTOCOL,
-    issue::PlainIssue,
+    issue::{IssueSeverity, PlainIssue},
     output::{OutputAsset, OutputAssets},
     source_map::{SourceMap, Token},
     version::{PartialUpdate, TotalUpdate, Update, VersionState},
@@ -1652,6 +1653,44 @@ pub async fn project_write_all_entrypoints_to_disk(
 
     issues.extend(emit_issues.iter().cloned());
 
+    // Written after all output assets have been emitted, in a separate operation and not as one of
+    // them (see `next_api::route_bundle_stats`). Skipped when the build failed.
+    let has_errors = issues
+        .iter()
+        .any(|issue| issue.severity <= IssueSeverity::Error);
+    if !has_errors {
+        let start = Instant::now();
+        let wall_start = SystemTime::now();
+        let route_bundle_stats_issues = tt
+            .run(async move {
+                let read = read_strongly_consistent_and_apply_effects(
+                    route_bundle_stats_with_issues_operation(container, app_dir_only),
+                    |v| &v.effects,
+                )
+                .await?;
+                let RouteBundleStatsWithIssues { file, issues, .. } = &*read;
+                if let Some(file) = file.as_ref().and_then(|file| file.as_ref()) {
+                    let path = to_sys_path(file.path.clone())
+                        .await?
+                        .context("route bundle stats must be written to disk")?;
+                    if let Some(dir) = path.parent() {
+                        tokio::fs::create_dir_all(dir).await?;
+                    }
+                    tokio::fs::write(&path, file.content.as_bytes()).await?;
+                }
+                Ok(issues.clone())
+            })
+            .or_else(|e| ctx.throw_turbopack_internal_result(&e.into()))
+            .await?;
+        issues.extend(route_bundle_stats_issues.iter().cloned());
+        tt.send_compilation_event(Arc::new(TraceEvent::new_with_duration(
+            "turbopack-route-bundle-stats",
+            wall_start,
+            start.elapsed(),
+            serde_json::json!([]),
+        )));
+    }
+
     Ok(TurbopackResult {
         result: if let Some(entrypoints) = entrypoints {
             Some(NapiEntrypoints::from_entrypoints_op(&entrypoints, ctx)?)
@@ -1785,6 +1824,40 @@ async fn emit_all_output_assets_once_with_issues_operation(
         serde_json::json!([]),
     )));
     result
+}
+
+#[turbo_tasks::function(operation, root)]
+fn route_bundle_stats_operation(
+    container: ResolvedVc<ProjectContainer>,
+    app_dir_only: bool,
+) -> Vc<OptionRouteBundleStatsFile> {
+    route_bundle_stats_file(container.project(), app_dir_only)
+}
+
+#[turbo_tasks::value(serialization = "skip")]
+struct RouteBundleStatsWithIssues {
+    file: Option<ReadRef<OptionRouteBundleStatsFile>>,
+    issues: Arc<Vec<ReadRef<PlainIssue>>>,
+    effects: Arc<Effects>,
+}
+
+#[turbo_tasks::function(operation, root)]
+async fn route_bundle_stats_with_issues_operation(
+    container: ResolvedVc<ProjectContainer>,
+    app_dir_only: bool,
+) -> Result<Vc<RouteBundleStatsWithIssues>> {
+    let filter = container.project().issue_filter().await?;
+    let (file, issues, effects) = strongly_consistent_catch_collectables(
+        route_bundle_stats_operation(container, app_dir_only),
+        &filter,
+    )
+    .await?;
+    Ok(RouteBundleStatsWithIssues {
+        file,
+        issues,
+        effects,
+    }
+    .cell())
 }
 
 #[turbo_tasks::function(operation)]
