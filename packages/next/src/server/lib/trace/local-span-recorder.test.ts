@@ -8,9 +8,11 @@ import { SpanStatusCode, trace } from 'next/dist/compiled/@opentelemetry/api'
 import {
   getLocalParentSpan,
   getOpenTelemetrySpan,
+  traceLocalSpan,
   withLocalSpan,
 } from './local-span-recorder'
 import { createRequestSpan, traceRequestSpan } from './request-span-recorder'
+import { BubbledError } from './tracer'
 import {
   resolveRequestInsightsIdentity,
   runWithRequestInsightsIdentity,
@@ -248,6 +250,71 @@ describe('local recording span', () => {
           type: 'TypeError',
           message: 'boom',
         },
+      }),
+    ])
+  })
+
+  it('preserves scoped tooling error metadata before rejecting', async () => {
+    const error = new TypeError('compiler failed')
+    const statuses: unknown[] = []
+
+    await expect(
+      traceLocalSpan(
+        { name: 'compiler', scope: true, recordToInsights: true },
+        async (span) => {
+          const setStatus = span.setStatus.bind(span)
+          jest.spyOn(span, 'setStatus').mockImplementation((status) => {
+            statuses.push(status)
+            return setStatus(status)
+          })
+          throw error
+        }
+      )
+    ).rejects.toBe(error)
+
+    expect(statuses).toEqual([
+      { code: SpanStatusCode.ERROR, message: 'compiler failed' },
+    ])
+    expect(spanRecords).toEqual([
+      expect.objectContaining({
+        name: 'compiler',
+        status: 'error',
+        error: { type: 'TypeError', message: 'compiler failed' },
+        attributes: expect.objectContaining({
+          failed: true,
+          'error.type': 'TypeError',
+        }),
+      }),
+    ])
+  })
+
+  it('preserves scoped tooling bubbled errors before rethrowing', () => {
+    const error = new BubbledError(true)
+
+    expect(() =>
+      traceLocalSpan(
+        {
+          name: 'bubbled compiler',
+          scope: true,
+          synchronous: true,
+          recordToInsights: true,
+        },
+        () => {
+          throw error
+        }
+      )
+    ).toThrow(error)
+
+    expect(spanRecords).toEqual([
+      expect.objectContaining({
+        name: 'bubbled compiler',
+        status: 'ok',
+        error: undefined,
+        events: undefined,
+        attributes: expect.objectContaining({
+          failed: true,
+          'next.bubble': true,
+        }),
       }),
     ])
   })

@@ -6,6 +6,13 @@ import {
   traceLocalSpan,
 } from '../server/lib/trace/local-span-recorder'
 import type { NextConfigComplete } from '../server/config-shared'
+import {
+  clearTraceEvents,
+  exportTraceState,
+  getTraceEvents,
+  initializeTraceState,
+} from '../trace/trace'
+import type { TraceState } from '../trace/types'
 
 import {
   TRACE_IGNORES,
@@ -101,7 +108,7 @@ export async function collectBuildTraces({
   distDir,
   edgeRuntimeRoutes,
   staticPages,
-  nextBuildSpan = createLocalSpan({ name: 'build' }),
+  nextBuildSpan,
   buildTraceContext,
   outputFileTracingRoot,
 }: {
@@ -126,6 +133,7 @@ export async function collectBuildTraces({
   await traceLocalSpan(
     {
       name: 'node-file-trace-build',
+      reportToOtel: true,
       parent: nextBuildSpan,
       attributes: {
         isTurbotrace: 'false', // TODO(arlyon): remove this
@@ -704,4 +712,17 @@ export async function collectBuildTraces({
   })
 
   debug(`finished build tracing ${Date.now() - startTime}ms`)
+}
+
+export async function workerCollectBuildTraces(
+  options: Parameters<typeof collectBuildTraces>[0] & { traceState: TraceState }
+) {
+  initializeTraceState({ ...options.traceState, shouldSaveTraceEvents: true })
+  clearTraceEvents()
+  try {
+    await collectBuildTraces(options)
+    return { events: getTraceEvents(), traceState: exportTraceState() }
+  } finally {
+    clearTraceEvents()
+  }
 }

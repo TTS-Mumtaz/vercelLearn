@@ -11,11 +11,14 @@ import type { Reporter } from './report/types'
 import type { TraceEvent } from './types'
 import {
   createLocalSpan,
+  getActiveLocalSpan,
   getToolingSpanSource,
   traceLocalSpan,
+  withLocalSpan,
 } from '../server/lib/trace/local-span-recorder'
 import { recordSpans } from '../server/lib/trace/span-store'
 import { setGlobal } from './shared'
+import { getToolingClock } from './clock'
 import {
   clearTraceEvents,
   closeAllTraces,
@@ -191,6 +194,113 @@ describe('Trace', () => {
       // recorded (which is when recordSpans is called).
       expect(child!.startTime).toEqual(startMs)
       expect(child!.duration).toEqual(1_500_000)
+    })
+
+    it('keeps explicit tooling HrTime completion on the monotonic clock', () => {
+      const span = createLocalSpan({
+        name: 'precise-completion',
+        monotonicStartTime: BigInt(1_000_000_001),
+        wallStartTimeMs: 1_700_000_000_000,
+      })
+      span.end([1, 1_234_568])
+      expect(getTraceEvents()).toMatchObject([
+        {
+          timestamp: 1_000_000,
+          startTime: 1_700_000_000_000,
+          duration: 1234,
+        },
+      ])
+    })
+
+    it('keeps local clocks paired when capture is descheduled', () => {
+      let monotonic = BigInt(5_000_000_000)
+      let wallTimeMs = 1_700_000_000_000
+      const hrtime = jest
+        .spyOn(process.hrtime, 'bigint')
+        .mockImplementation(() => monotonic)
+      const wallTime = jest
+        .spyOn(Date, 'now')
+        .mockImplementation(() => wallTimeMs)
+      try {
+        const reference = createLocalSpan({ name: 'reference' })
+        reference.end([5, 0])
+        monotonic += BigInt(1_000_000_000)
+        wallTimeMs += 1000
+        wallTime.mockImplementationOnce(() => {
+          monotonic += BigInt(50_000_000)
+          wallTimeMs += 50
+          return wallTimeMs
+        })
+
+        const delayed = createLocalSpan({ name: 'descheduled capture' })
+        delayed.end([6, 50_000_000])
+
+        const [first, second] = getTraceEvents()
+        expect(second.startTime! - first.startTime!).toBe(1050)
+        expect(second.timestamp - first.timestamp).toBe(1_050_000)
+        expect(second.duration).toBe(0)
+      } finally {
+        hrtime.mockRestore()
+        wallTime.mockRestore()
+      }
+    })
+
+    it('bounds clock sampling and retains the shortest interrupted sample', () => {
+      const hrtime = jest
+        .spyOn(process.hrtime, 'bigint')
+        .mockReturnValueOnce(BigInt(1_000_000_000))
+        .mockReturnValueOnce(BigInt(1_050_000_000))
+        .mockReturnValueOnce(BigInt(1_100_000_000))
+        .mockReturnValueOnce(BigInt(1_120_000_000))
+        .mockReturnValueOnce(BigInt(1_200_000_000))
+        .mockReturnValueOnce(BigInt(1_230_000_000))
+      const wallTime = jest
+        .spyOn(Date, 'now')
+        .mockReturnValueOnce(1_700_000_000_050)
+        .mockReturnValueOnce(1_700_000_000_120)
+        .mockReturnValueOnce(1_700_000_000_230)
+      try {
+        expect(getToolingClock()).toEqual({
+          monotonic: BigInt(1_100_000_000),
+          wallTimeMs: 1_700_000_000_120,
+        })
+        expect(hrtime).toHaveBeenCalledTimes(6)
+        expect(wallTime).toHaveBeenCalledTimes(3)
+      } finally {
+        hrtime.mockRestore()
+        wallTime.mockRestore()
+      }
+    })
+
+    it('only inherits and activates local scope when requested', () => {
+      const outer = createLocalSpan({ name: 'outer' })
+      withLocalSpan(outer, () => {
+        traceLocalSpan({ name: 'unscoped', synchronous: true }, () => {
+          expect(getActiveLocalSpan()).toBe(outer)
+        })
+        traceLocalSpan(
+          { name: 'scoped', scope: true, synchronous: true },
+          (span) => {
+            expect(getActiveLocalSpan()).toBe(span)
+            traceLocalSpan(
+              {
+                name: 'detached',
+                parent: null,
+                scope: true,
+                synchronous: true,
+              },
+              () => undefined
+            )
+          }
+        )
+      })
+      outer.end()
+      expect(getTraceEvents()).toMatchObject([
+        { name: 'unscoped', parentId: undefined },
+        { name: 'detached', parentId: undefined },
+        { name: 'scoped', parentId: getToolingSpanSource(outer)!.id },
+        { name: 'outer', parentId: undefined },
+      ])
     })
 
     // Builds flush repeatedly -- after each compilation, and again at the
@@ -432,6 +542,43 @@ describe('Trace', () => {
   })
 
   describe('Worker', () => {
+    it('captures selected ancestry without enabling the application SDK', () => {
+      initializeTraceState({ lastId: 0, shouldSaveTraceEvents: true })
+      const root = createLocalSpan({
+        name: 'selected-root',
+        reportToOtel: true,
+      })
+      const fine = createLocalSpan({ name: 'fine', parent: root })
+      const selected = createLocalSpan({
+        name: 'custom-selected',
+        parent: fine,
+        reportToOtel: true,
+      })
+      selected.end()
+      recordSpans(
+        [{ name: 'completed-selected', reportToOtel: true }],
+        'tooling',
+        fine
+      )
+      fine.end()
+      root.end()
+      const rootId = getToolingSpanSource(root)!.id
+      expect(exportTraceState()).toMatchObject({
+        otelClockOffset: expect.any(String),
+        toolingSpanSelections: [
+          { id: rootId, parentId: undefined },
+          { id: getToolingSpanSource(selected)!.id, parentId: rootId },
+          {
+            id: getTraceEvents().find(
+              (event) => event.name === 'completed-selected'
+            )!.id,
+            parentId: rootId,
+          },
+        ],
+      })
+      expect(exportTraceState()).not.toHaveProperty('otelInBuild')
+    })
+
     it('exports and initializes trace state', () => {
       const root = createLocalSpan({ name: 'root-span' })
       expect(getToolingSpanSource(root)?.id).toEqual(1)

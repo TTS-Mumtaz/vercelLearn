@@ -175,7 +175,7 @@ export async function loadClientReferenceManifestForPage(
 function loadRouteModule(page: string, distDir: string, isAppPath: boolean) {
   return getTracer().trace(
     LoadComponentsSpan.loadRouteModule,
-    { spanName: 'load route module' },
+    { reportToOtel: true, spanName: 'load route module' },
     () => requirePage(page, distDir, isAppPath)
   )
 }

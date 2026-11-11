@@ -43,8 +43,8 @@ import {
 import { RedirectStatusCode } from '../../client/components/redirect-status-code'
 import { DevBundlerService } from './dev-bundler-service'
 import type { Span } from '@opentelemetry/api'
-import { getTracer } from './trace/tracer'
 import { ToolingSpan } from './trace/constants'
+import { traceLocalSpan } from './trace/local-span-recorder'
 import { ensureLeadingSlash } from '../../shared/lib/page-path/ensure-leading-slash'
 import { getNextPathnameInfo } from '../../shared/lib/router/utils/get-next-pathname-info'
 import { getHostname } from '../../shared/lib/get-hostname'
@@ -169,6 +169,7 @@ export async function initialize(opts: {
   experimentalHttpsServer?: boolean
   serverFastRefresh?: boolean
   startServerSpan?: Span
+  devServerSessionSpan?: Span
   quiet?: boolean
 }): Promise<ServerInitResult> {
   if (!process.env.NODE_ENV) {
@@ -245,9 +246,14 @@ export async function initialize(opts: {
       ;(globalThis as Record<symbol, unknown>)[NEXT_PATCH_SYMBOL] = false
     }
 
-    const { developmentBundler, developmentConfig } = await getTracer().trace(
-      ToolingSpan.setupDevBundler,
-      { parentSpan: opts.startServerSpan },
+    const { developmentBundler, developmentConfig } = await traceLocalSpan(
+      {
+        name: ToolingSpan.setupDevBundler,
+        reportToOtel: true,
+        recordToInsights: true,
+        scope: true,
+        parent: opts.startServerSpan,
+      },
       async () => {
         // In development, it's always the complete config.
         const resolvedDevelopmentConfig = config as NextConfigComplete

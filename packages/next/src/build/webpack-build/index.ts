@@ -8,9 +8,11 @@ import path from 'path'
 import { exportTraceState, recordTraceEvents } from '../../trace'
 import { mergeUseCacheTrackers } from '../webpack/plugins/telemetry-plugin/use-cache-tracker-utils'
 import { durationToString } from '../duration-to-string'
-import { getTracer } from '../../server/lib/trace/tracer'
 import { ToolingSpan } from '../../server/lib/trace/constants'
-import { getToolingSpanSource } from '../../server/lib/trace/local-span-recorder'
+import {
+  getToolingSpanSource,
+  traceLocalSpan,
+} from '../../server/lib/trace/local-span-recorder'
 
 const debug = origDebug('next:build:webpack-build')
 
@@ -80,7 +82,10 @@ async function webpackBuildWithWorker(
       },
     })
     if (nextBuildSpan && curResult.debugTraceEvents) {
-      recordTraceEvents(curResult.debugTraceEvents)
+      recordTraceEvents(
+        curResult.debugTraceEvents,
+        curResult.debugTraceSelections
+      )
     }
     // destroy worker so it's not sticking around using memory
     await worker.end()
@@ -141,9 +146,14 @@ export async function webpackBuild(
   | Awaited<ReturnType<typeof import('./impl').webpackBuildImpl>>
 > {
   const nextBuildSpan = NextBuildContext.nextBuildSpan!
-  return getTracer().trace(
-    ToolingSpan.runWebpack,
-    { parent: nextBuildSpan },
+  return traceLocalSpan(
+    {
+      name: ToolingSpan.runWebpack,
+      reportToOtel: true,
+      recordToInsights: true,
+      scope: true,
+      parent: nextBuildSpan,
+    },
     async () => {
       if (withWorker) {
         debug('using separate compiler workers')

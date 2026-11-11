@@ -713,6 +713,7 @@ export abstract class RouteModule<
         tracer.trace(
           BaseServerSpan.handleRequest,
           {
+            reportToOtel: true,
             spanName,
             kind: SpanKind.SERVER,
             startTime: instrumentation?.startTime,
@@ -741,7 +742,7 @@ export abstract class RouteModule<
   ) {
     return getTracer().trace(
       RouteModuleSpan.prepare,
-      { spanName: 'prepare route module' },
+      { reportToOtel: true, spanName: 'prepare route module' },
       () => this.prepareImpl(req, res, options)
     )
   }

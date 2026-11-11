@@ -923,6 +923,7 @@ export default abstract class Server<
           return tracer.trace(
             BaseServerSpan.handleRequest,
             {
+              reportToOtel: true,
               spanName: `${method}`,
               kind: SpanKind.SERVER,
               attributes: {

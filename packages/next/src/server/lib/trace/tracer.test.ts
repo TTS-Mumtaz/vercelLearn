@@ -27,6 +27,11 @@ import {
   type SpanStoreRecord,
 } from './span-store'
 import {
+  createLocalSpan,
+  getActiveLocalSpan,
+  traceLocalSpan,
+} from './local-span-recorder'
+import {
   registerLocalSpanRecorder,
   traceRequestSpan,
 } from './request-span-recorder'
@@ -330,7 +335,11 @@ describe('local span recording', () => {
   it('does not mirror spans by default', () => {
     setSpanRecorderForTest(undefined)
 
-    const result = getTracer().trace(NodeSpan.runHandler, () => 'result')
+    const result = getTracer().trace(
+      NodeSpan.runHandler,
+      { reportToOtel: true },
+      () => 'result'
+    )
 
     expect(result).toBe('result')
     expect(getSpanRecords()).toEqual([])
@@ -341,7 +350,11 @@ describe('local span recording', () => {
     const workerRecords: SpanStoreRecord[] = []
     registerLocalSpanRecorder({ sinkOnly: true })
 
-    getTracer().trace(NodeSpan.runHandler, () => undefined)
+    getTracer().trace(
+      NodeSpan.runHandler,
+      { reportToOtel: true },
+      () => undefined
+    )
     expect(workerRecords).toEqual([])
 
     await runWithLocalSpanSink(
@@ -350,8 +363,11 @@ describe('local span recording', () => {
         expect(isLocalSpanRecordingEnabled()).toBe(true)
         return getTracer().trace(
           LoadComponentsSpan.loadRouteModule,
-          { spanName: 'load route module' },
-          () => getTracer().trace(NodeSpan.runHandler, () => Promise.resolve())
+          { reportToOtel: true, spanName: 'load route module' },
+          () =>
+            getTracer().trace(NodeSpan.runHandler, { reportToOtel: true }, () =>
+              Promise.resolve()
+            )
         )
       }
     )
@@ -369,12 +385,16 @@ describe('local span recording', () => {
         parentSpanId: loadSpan.spanId,
       })
     )
-    getTracer().trace(NodeSpan.runHandler, () => undefined)
+    getTracer().trace(
+      NodeSpan.runHandler,
+      { reportToOtel: true },
+      () => undefined
+    )
     expect(workerRecords).toHaveLength(2)
     registerLocalSpanRecorder()
   })
 
-  it('records non-vanilla trace and wrapped spans for request insights', () => {
+  it('records unselected trace and wrapped spans for request insights', () => {
     process.env.__NEXT_REQUEST_INSIGHTS = 'true'
 
     getTracer().trace(BaseServerSpan.render, () => undefined)
@@ -400,7 +420,7 @@ describe('local span recording', () => {
     ])
   })
 
-  it('only exports non-vanilla spans when verbose tracing is enabled', () => {
+  it('only exports selected spans unless verbose tracing is enabled', () => {
     process.env.__NEXT_REQUEST_INSIGHTS = 'true'
     const exportedSpans: string[] = []
     const delegateSpan = trace.wrapSpanContext({
@@ -429,20 +449,44 @@ describe('local span recording', () => {
     getTracer().trace(BaseServerSpan.render, () => undefined)
     expect(exportedSpans).toEqual([])
 
-    getTracer().trace(NodeSpan.runHandler, () => undefined)
+    getTracer().trace(
+      NodeSpan.runHandler,
+      { reportToOtel: true },
+      () => undefined
+    )
     expect(exportedSpans).toEqual([NodeSpan.runHandler])
 
-    getTracer().trace(LoadComponentsSpan.loadRouteModule, () => undefined)
+    getTracer().trace(
+      LoadComponentsSpan.loadRouteModule,
+      { reportToOtel: true },
+      () => undefined
+    )
     expect(exportedSpans).toEqual([
       NodeSpan.runHandler,
       LoadComponentsSpan.loadRouteModule,
     ])
 
-    getTracer().trace(RouteModuleSpan.prepare, () => undefined)
-    getTracer().trace(AppRouteRouteModuleSpan.loadUserland, () => undefined)
+    getTracer().trace(
+      RouteModuleSpan.prepare,
+      { reportToOtel: true },
+      () => undefined
+    )
+    getTracer().trace(
+      AppRouteRouteModuleSpan.loadUserland,
+      { reportToOtel: true },
+      () => undefined
+    )
     getTracer().trace(RouteModuleSpan.loadManifests, () => undefined)
-    getTracer().trace(InstrumentationSpan.register, () => undefined)
-    getTracer().trace(InstrumentationSpan.loadModule, () => undefined)
+    getTracer().trace(
+      InstrumentationSpan.register,
+      { reportToOtel: true },
+      () => undefined
+    )
+    getTracer().trace(
+      InstrumentationSpan.loadModule,
+      { reportToOtel: true },
+      () => undefined
+    )
     expect(exportedSpans).toEqual([
       NodeSpan.runHandler,
       LoadComponentsSpan.loadRouteModule,
@@ -455,7 +499,11 @@ describe('local span recording', () => {
     process.env.NEXT_OTEL_VERBOSE = '1'
     getTracer().trace(BaseServerSpan.render, () => undefined)
     getTracer().trace(RouteModuleSpan.loadManifests, () => undefined)
-    getTracer().trace(InstrumentationSpan.loadModule, () => undefined)
+    getTracer().trace(
+      InstrumentationSpan.loadModule,
+      { reportToOtel: true },
+      () => undefined
+    )
     expect(exportedSpans).toEqual([
       NodeSpan.runHandler,
       LoadComponentsSpan.loadRouteModule,
@@ -490,14 +538,92 @@ describe('local span recording', () => {
     expect(startActiveSpan).not.toHaveBeenCalled()
   })
 
+  it('selects exports through creation options and evaluates wrapped options per call', () => {
+    delete process.env.__NEXT_DEV_SERVER
+    const exported: string[] = []
+    const delegate = trace.wrapSpanContext({
+      traceId: '0123456789abcdef0123456789abcdef',
+      spanId: '0123456789abcdef',
+      traceFlags: 1,
+    })
+    trace.setGlobalTracerProvider({
+      getTracer() {
+        return {
+          startSpan: () => delegate,
+          startActiveSpan(...args: unknown[]) {
+            exported.push(args[0] as string)
+            const fn = args.at(-1) as (span: Span) => unknown
+            return fn(delegate)
+          },
+        }
+      },
+    })
+
+    getTracer().trace(
+      BaseServerSpan.render,
+      { reportToOtel: true },
+      () => undefined
+    )
+    getTracer().trace(
+      NodeSpan.runHandler,
+      { reportToOtel: false },
+      () => undefined
+    )
+    const options = jest.fn((reportToOtel: boolean) => ({ reportToOtel }))
+    const wrapped = getTracer().wrap(
+      NodeSpan.runHandler,
+      options,
+      function (this: { value: string }, _reportToOtel: boolean) {
+        return this.value
+      }
+    )
+    expect(wrapped.call({ value: 'unselected' }, false)).toBe('unselected')
+    expect(wrapped.call({ value: 'selected' }, true)).toBe('selected')
+    expect(options.mock.calls).toEqual([[false], [true]])
+    expect(exported).toEqual([BaseServerSpan.render, NodeSpan.runHandler])
+  })
+
+  it('keeps a skipped direct span under its public parent without creating SDK work', () => {
+    delete process.env.__NEXT_DEV_SERVER
+    context.setGlobalContextManager(new TestContextManager())
+    const parent = trace.wrapSpanContext({
+      traceId: '0123456789abcdef0123456789abcdef',
+      spanId: '0123456789abcdef',
+      traceFlags: 1,
+    })
+    const startSpan = jest.fn(() => parent)
+    trace.setGlobalTracerProvider({
+      getTracer: () => ({ startSpan, startActiveSpan: jest.fn() }),
+    })
+
+    context.with(trace.setSpan(ROOT_CONTEXT, parent), () => {
+      const skipped = getTracer().startSpan(NodeSpan.runHandler)
+      expect(skipped.isRecording()).toBe(false)
+      expect(skipped.spanContext()).toEqual(parent.spanContext())
+      getTracer().withSpan(skipped, () => {
+        expect(trace.getSpanContext(context.active())).toEqual(
+          parent.spanContext()
+        )
+      })
+      skipped.end()
+      expect(startSpan).not.toHaveBeenCalled()
+      getTracer().startSpan(NodeSpan.runHandler, { reportToOtel: true }).end()
+      expect(startSpan).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('bypasses local span handling outside the dev server', () => {
     delete process.env.__NEXT_DEV_SERVER
     let receivedSpan: unknown = 'not-called'
 
-    const result = getTracer().trace(NodeSpan.runHandler, (span) => {
-      receivedSpan = span
-      return 'result'
-    })
+    const result = getTracer().trace(
+      NodeSpan.runHandler,
+      { reportToOtel: true },
+      (span) => {
+        receivedSpan = span
+        return 'result'
+      }
+    )
 
     expect(result).toBe('result')
     expect(receivedSpan).toBeUndefined()
@@ -508,6 +634,7 @@ describe('local span recording', () => {
     const result = getTracer().trace(
       NodeSpan.runHandler,
       {
+        reportToOtel: true,
         spanName: 'test.sync',
         attributes: {
           'next.route': '/products/[id]',
@@ -541,7 +668,7 @@ describe('local span recording', () => {
 
     getTracer().trace(
       InstrumentationSpan.register,
-      { startTime, endTime },
+      { reportToOtel: true, startTime, endTime },
       () => undefined
     )
 
@@ -554,6 +681,7 @@ describe('local span recording', () => {
     const result = await getTracer().trace(
       AppRenderSpan.fetch,
       {
+        reportToOtel: true,
         kind: SpanKind.CLIENT,
         spanName: 'fetch GET https://example.vercel.sh/',
         attributes: {
@@ -628,11 +756,16 @@ describe('local span recording', () => {
           { name: 'Prepare validation inputs' },
           async () => {
             activeSpanDuringNestedLocalWork = trace.getSpan(context.active())
-            getTracer().trace(NextNodeServerSpan.createComponentTree, () => {
-              activeSpanDuringNextTrace = trace.getSpan(context.active())
-            })
+            getTracer().trace(
+              NextNodeServerSpan.createComponentTree,
+              { reportToOtel: true },
+              () => {
+                activeSpanDuringNextTrace = trace.getSpan(context.active())
+              }
+            )
             const directSpan = getTracer().startSpan(
-              NextNodeServerSpan.getLayoutOrPageModule
+              NextNodeServerSpan.getLayoutOrPageModule,
+              { reportToOtel: true }
             )
             getTracer().withSpan(directSpan, () => {
               activeSpanDuringDirectWithSpan = trace.getSpan(context.active())
@@ -694,7 +827,7 @@ describe('local span recording', () => {
       getTracer().trace(AppRenderSpan.renderToReadableStream, (localParent) => {
         expect(getTracer().getActiveScopeSpan()).toBe(localParent)
         expect(trace.getSpan(context.active())).toBe(publicParent)
-        getTracer().trace(AppRenderSpan.fetch, () => {
+        getTracer().trace(AppRenderSpan.fetch, { reportToOtel: true }, () => {
           expect(trace.getSpan(context.active())).toBe(publicParent)
         })
       })
@@ -725,7 +858,7 @@ describe('local span recording', () => {
       getTracer().trace(AppRenderSpan.renderToReadableStream, (localParent) => {
         context.with(trace.setSpan(context.active(), publicChild), () => {
           expect(getTracer().getActiveScopeSpan()).toBe(publicChild)
-          getTracer().trace(AppRenderSpan.fetch, () => {
+          getTracer().trace(AppRenderSpan.fetch, { reportToOtel: true }, () => {
             expect(trace.getSpan(context.active())).toBe(publicChild)
           })
         })
@@ -753,7 +886,7 @@ describe('local span recording', () => {
         })
         getTracer().trace(
           AppRenderSpan.fetch,
-          { parentSpan: localParent },
+          { reportToOtel: true, parentSpan: localParent },
           () => {
             expect(trace.getSpan(context.active())).toBe(publicParent)
           }
@@ -772,7 +905,8 @@ describe('local span recording', () => {
   it('does not borrow an unrelated public span for an explicit local root', () => {
     context.setGlobalContextManager(new TestContextManager())
     const localRoot = getTracer().startSpan(
-      AppRenderSpan.renderToReadableStream
+      AppRenderSpan.renderToReadableStream,
+      { reportToOtel: true }
     )
     const unrelated = trace.wrapSpanContext({
       traceId: '0123456789abcdef0123456789abcdef',
@@ -785,9 +919,13 @@ describe('local span recording', () => {
         expect(trace.getSpan(context.active())).toBeUndefined()
         expect(getTracer().getActiveScopeSpan()).toBe(localRoot)
       })
-      getTracer().trace(AppRenderSpan.fetch, { parentSpan: localRoot }, () => {
-        expect(trace.getSpan(context.active())).toBeUndefined()
-      })
+      getTracer().trace(
+        AppRenderSpan.fetch,
+        { reportToOtel: true, parentSpan: localRoot },
+        () => {
+          expect(trace.getSpan(context.active())).toBeUndefined()
+        }
+      )
       expect(trace.getSpan(context.active())).toBe(unrelated)
     })
     localRoot.end()
@@ -841,7 +979,7 @@ describe('local span recording', () => {
   it('mirrors span mutations made through the OTel span API', () => {
     const result = getTracer().trace(
       NodeSpan.runHandler,
-      { spanName: 'test.mutated' },
+      { reportToOtel: true, spanName: 'test.mutated' },
       (span) => {
         span?.setAttribute('http.status_code', 200)
         span?.setAttributes({
@@ -879,7 +1017,7 @@ describe('local span recording', () => {
   it('mirrors span status without a thrown error', () => {
     const result = getTracer().trace(
       NodeSpan.runHandler,
-      { spanName: 'test.status' },
+      { reportToOtel: true, spanName: 'test.status' },
       (span) => {
         span?.setStatus({
           code: SpanStatusCode.ERROR,
@@ -904,7 +1042,7 @@ describe('local span recording', () => {
   it('records async trace calls when the returned promise settles', async () => {
     const result = await getTracer().trace(
       NodeSpan.runHandler,
-      { spanName: 'test.async' },
+      { reportToOtel: true, spanName: 'test.async' },
       async () => {
         await Promise.resolve()
         return 'result'
@@ -924,7 +1062,7 @@ describe('local span recording', () => {
   it('records callback trace calls when done is called', () => {
     const result = getTracer().trace(
       NodeSpan.runHandler,
-      { spanName: 'test.callback' },
+      { reportToOtel: true, spanName: 'test.callback' },
       (_span, done) => {
         done?.()
         return 'result'
@@ -965,7 +1103,7 @@ describe('local span recording', () => {
 
     const result = getTracer().trace(
       NodeSpan.runHandler,
-      { spanName: 'test.callback.provider' },
+      { reportToOtel: true, spanName: 'test.callback.provider' },
       (_span, done) => {
         done?.()
         return 'result'
@@ -984,6 +1122,7 @@ describe('local span recording', () => {
 
   it('records direct spans with active local parent identity', () => {
     const parentSpan = getTracer().startSpan(NodeSpan.runHandler, {
+      reportToOtel: true,
       attributes: { 'next.page': 'parent' },
     })
     let childSpanId: string | undefined
@@ -992,6 +1131,7 @@ describe('local span recording', () => {
       expect(getTracer().getActiveScopeSpan()).toBe(parentSpan)
 
       const childSpan = getTracer().startSpan(AppRenderSpan.fetch, {
+        reportToOtel: true,
         attributes: {
           'next.page': 'child',
           'next.span_category': 'application',
@@ -1034,9 +1174,13 @@ describe('local span recording', () => {
 
   it('records thrown errors before rethrowing', () => {
     expect(() =>
-      getTracer().trace(NodeSpan.runHandler, { spanName: 'test.error' }, () => {
-        throw new Error('boom')
-      })
+      getTracer().trace(
+        NodeSpan.runHandler,
+        { reportToOtel: true, spanName: 'test.error' },
+        () => {
+          throw new Error('boom')
+        }
+      )
     ).toThrow('boom')
 
     expect(getSpanRecords({ name: 'test.error' })).toEqual([
@@ -1153,6 +1297,7 @@ describe('local span recording', () => {
 
 describe('tooling request insights', () => {
   beforeEach(() => {
+    context.disable()
     process.env.__NEXT_DEV_SERVER = '1'
     process.env.__NEXT_REQUEST_INSIGHTS = 'true'
     registerLocalSpanRecorder()
@@ -1161,6 +1306,7 @@ describe('tooling request insights', () => {
   })
 
   afterEach(() => {
+    context.disable()
     if (originalRequestInsights === undefined)
       delete process.env.__NEXT_REQUEST_INSIGHTS
     else process.env.__NEXT_REQUEST_INSIGHTS = originalRequestInsights
@@ -1170,14 +1316,55 @@ describe('tooling request insights', () => {
     setLocalSpanExporter(undefined)
   })
 
+  it('isolates a local operation scope from the public SDK context', () => {
+    context.setGlobalContextManager(new TestContextManager())
+    const publicSpan = trace.wrapSpanContext({
+      traceId: '0123456789abcdef0123456789abcdef',
+      spanId: '0123456789abcdef',
+      traceFlags: 1,
+    })
+    context.with(trace.setSpan(ROOT_CONTEXT, publicSpan), () => {
+      traceLocalSpan(
+        {
+          name: ToolingSpan.compilePath,
+          reportToOtel: true,
+          recordToInsights: true,
+          scope: true,
+          synchronous: true,
+        },
+        (span) => {
+          expect(getActiveLocalSpan()).toBe(span)
+          expect(trace.getSpan(context.active())).toBeUndefined()
+        }
+      )
+      expect(trace.getSpan(context.active())).toBe(publicSpan)
+    })
+  })
+
   it('groups startup spans and completes the activity once', () => {
     let root: Span | undefined
-    getTracer().trace(
-      ToolingSpan.startDevServer,
-      { spanName: 'Dev startup' },
+    traceLocalSpan(
+      {
+        name: 'Dev startup',
+        reportToOtel: true,
+        recordToInsights: true,
+        reportingRoot: true,
+        attributes: { 'next.span_type': ToolingSpan.startDevServer },
+        scope: true,
+        synchronous: true,
+      },
       (span) => {
         root = span
-        getTracer().trace(ToolingSpan.setupDevBundler, () => undefined)
+        traceLocalSpan(
+          {
+            name: ToolingSpan.setupDevBundler,
+            reportToOtel: true,
+            recordToInsights: true,
+            scope: true,
+            synchronous: true,
+          },
+          () => undefined
+        )
       }
     )
     root!.end()
@@ -1209,8 +1396,12 @@ describe('tooling request insights', () => {
       identities.map((identity) =>
         runWithRequestInsightsIdentity(identity, async () => {
           await Promise.resolve()
-          return getTracer().startSpan(ToolingSpan.compilePath, {
-            spanName: identity.url,
+          return createLocalSpan({
+            name: identity.url,
+            reportToOtel: true,
+            recordToInsights: true,
+            parent: getActiveLocalSpan(),
+            attributes: { 'next.span_type': ToolingSpan.compilePath },
           })
         })
       )
@@ -1238,8 +1429,22 @@ describe('tooling request insights', () => {
     startRequestInsight(identity)
     runWithRequestInsightsIdentity(identity, () =>
       traceRequestSpan({ name: 'request', synchronous: true }, (parent) => {
-        getTracer().startSpan(ToolingSpan.compilePath).end()
-        getTracer().trace(ToolingSpan.webpackCompilation, () => undefined)
+        createLocalSpan({
+          name: ToolingSpan.compilePath,
+          reportToOtel: true,
+          recordToInsights: true,
+          parent: getActiveLocalSpan(),
+        }).end()
+        traceLocalSpan(
+          {
+            name: ToolingSpan.webpackCompilation,
+            reportToOtel: true,
+            recordToInsights: true,
+            scope: true,
+            synchronous: true,
+          },
+          () => undefined
+        )
         const { requests } = getRequestInsightsSnapshot()
         expect(requests).toHaveLength(1)
         expect(requests[0].spans).toHaveLength(2)
@@ -1252,14 +1457,26 @@ describe('tooling request insights', () => {
   })
 
   it('gives unrelated background compilations separate activities', () => {
-    getTracer().trace(
-      ToolingSpan.compilePath,
-      { spanName: 'first compilation' },
+    traceLocalSpan(
+      {
+        name: 'first compilation',
+        reportToOtel: true,
+        recordToInsights: true,
+        attributes: { 'next.span_type': ToolingSpan.compilePath },
+        scope: true,
+        synchronous: true,
+      },
       () => undefined
     )
-    getTracer().trace(
-      ToolingSpan.compilePath,
-      { spanName: 'second compilation' },
+    traceLocalSpan(
+      {
+        name: 'second compilation',
+        reportToOtel: true,
+        recordToInsights: true,
+        attributes: { 'next.span_type': ToolingSpan.compilePath },
+        scope: true,
+        synchronous: true,
+      },
       () => undefined
     )
     const { requests } = getRequestInsightsSnapshot()
@@ -1271,11 +1488,23 @@ describe('tooling request insights', () => {
   })
 
   it('keeps background HMR separate from its completed startup parent', () => {
-    const startup = getTracer().startSpan(ToolingSpan.startDevServer)
+    const startup = createLocalSpan({
+      name: ToolingSpan.startDevServer,
+      reportToOtel: true,
+      recordToInsights: true,
+      parent: getActiveLocalSpan(),
+      reportingRoot: true,
+    })
     startup.end()
-    getTracer().trace(
-      ToolingSpan.webpackCompilation,
-      { parent: startup },
+    traceLocalSpan(
+      {
+        name: ToolingSpan.webpackCompilation,
+        reportToOtel: true,
+        recordToInsights: true,
+        parent: startup,
+        scope: true,
+        synchronous: true,
+      },
       () => undefined
     )
     const { requests } = getRequestInsightsSnapshot()
@@ -1292,7 +1521,13 @@ describe('tooling request insights', () => {
     const records: SpanStoreRecord[] = []
     const span = runWithLocalSpanSink(
       (record) => records.push(record),
-      () => getTracer().startSpan(ToolingSpan.compilePath)
+      () =>
+        createLocalSpan({
+          name: ToolingSpan.compilePath,
+          reportToOtel: true,
+          recordToInsights: true,
+          parent: getActiveLocalSpan(),
+        })
     )
     span.end()
     expect(records).toHaveLength(1)
@@ -1302,7 +1537,16 @@ describe('tooling request insights', () => {
 
   it('keeps request insights disabled when its flag is off', () => {
     delete process.env.__NEXT_REQUEST_INSIGHTS
-    getTracer().trace(ToolingSpan.compilePath, () => undefined)
+    traceLocalSpan(
+      {
+        name: ToolingSpan.compilePath,
+        reportToOtel: true,
+        recordToInsights: true,
+        scope: true,
+        synchronous: true,
+      },
+      () => undefined
+    )
     expect(getRequestInsightsSnapshot().requests).toEqual([])
   })
 })

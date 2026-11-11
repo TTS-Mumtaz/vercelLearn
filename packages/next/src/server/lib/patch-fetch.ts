@@ -414,6 +414,7 @@ export function createPatchedFetcher(
     const result = getTracer().trace(
       isInternal ? NextNodeServerSpan.internalFetch : AppRenderSpan.fetch,
       {
+        reportToOtel: !isInternal,
         hideSpan,
         kind: SpanKind.CLIENT,
         spanName: ['fetch', method, fetchUrl].filter(Boolean).join(' '),

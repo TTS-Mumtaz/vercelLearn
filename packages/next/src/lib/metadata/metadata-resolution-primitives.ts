@@ -516,6 +516,7 @@ export function getDefinedViewport(
         getTracer().trace(
           ResolveMetadataSpan.generateViewport,
           {
+            reportToOtel: true,
             spanName: `generateViewport ${route}`,
             attributes: {
               'next.page': route,
@@ -543,6 +544,7 @@ export function getDefinedMetadata(
         getTracer().trace(
           ResolveMetadataSpan.generateMetadata,
           {
+            reportToOtel: true,
             spanName: `generateMetadata ${route}`,
             attributes: {
               'next.page': route,

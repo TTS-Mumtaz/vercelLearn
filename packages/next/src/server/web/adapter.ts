@@ -337,6 +337,7 @@ export async function adapter(
         return tracer.trace(
           MiddlewareSpan.execute,
           {
+            reportToOtel: true,
             spanName: `middleware ${request.method}`,
             startTime: params.emitInstrumentationSpans
               ? params.requestStartTime
@@ -442,6 +443,7 @@ export async function adapter(
         return tracer.trace(
           NextSpan.request,
           {
+            reportToOtel: true,
             spanName: request.method,
             kind: SpanKind.SERVER,
             startTime: params.requestStartTime,

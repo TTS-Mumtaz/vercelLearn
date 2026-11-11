@@ -364,6 +364,7 @@ async function requestHandler(
     tracer.trace(
       BaseServerSpan.handleRequest,
       {
+        reportToOtel: true,
         spanName: `${req.method} ${srcPage}`,
         kind: SpanKind.SERVER,
         attributes: {

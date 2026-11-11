@@ -52,6 +52,7 @@ export function backgroundLogCompilationEvents(
             [
               {
                 name: data.name,
+                reportToOtel: data.reportToOtel === true,
                 startTime: msToNs(data.startTimeMs),
                 endTime: msToNs(data.endTimeMs),
                 attributes: Object.fromEntries(data.attributes ?? []),

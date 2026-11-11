@@ -107,6 +107,7 @@ describe('span recording', () => {
       [
         {
           name: 'client-hmr-latency',
+          recordToInsights: true,
           startTime: endTime - BigInt(15_000_000),
           endTime,
           attributes: { page: '/' },
@@ -125,6 +126,54 @@ describe('span recording', () => {
         expect.objectContaining({ name: 'client-hmr-latency', durationMs: 15 }),
       ],
     })
+  })
+
+  it('keeps completed observations on the local clock after descheduling', () => {
+    const { initializeTraceState, getTraceEvents, clearTraceEvents } =
+      require('../../../trace/trace') as typeof import('../../../trace/trace')
+    initializeTraceState({ lastId: 0, shouldSaveTraceEvents: true })
+    clearTraceEvents()
+    const epoch = BigInt(1_700_000_000_000_000_000)
+    let monotonic = BigInt(5_000_000_000)
+    let wallTimeMs = 1_700_000_000_000
+    const hrtime = jest
+      .spyOn(process.hrtime, 'bigint')
+      .mockImplementation(() => monotonic)
+    const wallTime = jest
+      .spyOn(Date, 'now')
+      .mockImplementationOnce(() => {
+        monotonic += BigInt(50_000_000)
+        wallTimeMs += 50
+        return wallTimeMs
+      })
+      .mockImplementation(() => wallTimeMs)
+    try {
+      recordSpans(
+        [
+          {
+            name: 'completed native observation',
+            startTime: epoch - BigInt(15_000_000),
+            endTime: epoch,
+          },
+        ],
+        'tooling',
+        undefined
+      )
+
+      expect(getTraceEvents()).toEqual([
+        expect.objectContaining({
+          name: 'completed native observation',
+          timestamp: 4_985_000,
+          startTime: 1_699_999_999_985,
+          duration: 15_000,
+        }),
+      ])
+    } finally {
+      hrtime.mockRestore()
+      wallTime.mockRestore()
+      clearTraceEvents()
+      initializeTraceState({ lastId: 0 })
+    }
   })
 
   it('scopes forwarded span recording without retaining it locally', () => {

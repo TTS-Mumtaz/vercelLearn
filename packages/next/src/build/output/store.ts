@@ -1,7 +1,10 @@
+import {
+  createLocalSpan,
+  getActiveLocalSpan,
+} from '../../server/lib/trace/local-span-recorder'
 import createStore from 'next/dist/compiled/unistore'
 import { flushAllTraces } from '../../trace'
 import type { Span } from '@opentelemetry/api'
-import { getTracer } from '../../server/lib/trace/tracer'
 import { ToolingSpan } from '../../server/lib/trace/constants'
 import { teardownTraceSubscriber } from '../swc'
 import * as Log from './log'
@@ -108,7 +111,11 @@ store.subscribe((state) => {
       trigger = formatTrigger(state.trigger)
       triggerUrl = state.url
       if (trigger !== 'initial') {
-        traceSpan = getTracer().startSpan(ToolingSpan.compilePath, {
+        traceSpan = createLocalSpan({
+          name: ToolingSpan.compilePath,
+          parent: getActiveLocalSpan(),
+          reportToOtel: true,
+          recordToInsights: true,
           attributes: { trigger },
         })
         if (!loadingLogTimer) {

@@ -1,5 +1,8 @@
 import type {
   AttributeValue,
+  Attributes,
+  Context,
+  SpanStatus,
   Span,
   SpanContext,
   SpanOptions,
@@ -15,6 +18,13 @@ import type {
 import type { ToolingSpanSource } from '../../../trace/trace'
 import type { SpanId } from '../../../trace/types'
 import { getOrCreateGlobalAsyncLocalStorage } from '../../app-render/async-local-storage'
+import { getTimestamp, toHrTime } from './utils'
+import type {
+  ReportingToken,
+  ReportingStart,
+  ReportingCompletion,
+  ReplaySnapshot,
+} from './local-span-replay.node'
 
 export { isLocalSpanRecordingEnabled } from './span-store'
 
@@ -33,14 +43,20 @@ export type LocalSpanOptions = {
   links?: SpanOptions['links']
   /** Public OTel timestamp (epoch/relative milliseconds, Date or HrTime). */
   startTime?: SpanOptions['startTime']
+  endTime?: Parameters<Span['end']>[0]
+  monotonicEndTime?: bigint
   /** Lossless process.hrtime.bigint() timestamp, independent of wall time. */
   monotonicStartTime?: bigint
   wallStartTimeMs?: number
   traceId?: string
   spanId?: string
   delegateSpan?: Span
+  openTelemetry?: { options: SpanOptions; context: Context }
   publicParentSpan?: Span
   isolateOpenTelemetry?: boolean
+  reportToOtel?: boolean
+  recordToInsights?: boolean
+  reportingRoot?: boolean
 }
 
 export type LocalSpanDelivery = (spans: readonly SpanStoreRecord[]) => void
@@ -49,18 +65,52 @@ type TraceExistingLocalSpanOptions = {
   span: LocalRecordingSpan
 }
 
-// This association contains clocks/identity only, never mutable attributes,
-// events or another end guard. Request spans do not enter this map.
-const toolingSources = new WeakMap<Span, ToolingSpanSource>()
 // Keep request-only/Edge imports independent of the tooling module. Cache its
 // lazy load: even a cached require otherwise repeats resolution on every span.
 let toolingTracing: typeof import('../../../trace/trace') | undefined
+let toolingReplay: typeof import('./local-span-replay.node') | undefined
+function getToolingReplay() {
+  if (process.env.NEXT_RUNTIME === 'edge') {
+    return undefined
+  } else {
+    return (toolingReplay ??=
+      require('./local-span-replay.node') as typeof import('./local-span-replay.node'))
+  }
+}
+
+type ToolingReporting = {
+  source: ToolingSpanSource
+  parent?: ReportingToken
+  selectedId?: number
+  token?: ReportingToken
+  name: string
+}
+const toolingReporting = new WeakMap<Span, ToolingReporting>()
+let delivering = false
+const pendingReporting = new Map<ReportingToken, ReplaySnapshot>()
+
+export type LocalSpanDelegate = {
+  span?: Span
+  context?: SpanContext
+  onError?: () => void
+  eventsForwarded?: number
+}
+export type LocalSpanCompletion = {
+  name?: string
+  attributes?: Parameters<Span['setAttributes']>[0]
+  events?: SpanStoreEvent[]
+  status?: SpanStatus
+}
+
+function canUseDelegate() {
+  return true
+}
 
 /** Internal numeric identity/clock metadata, independent of public OTel IDs. */
 export function getToolingSpanSource(
   span: Span
 ): ToolingSpanSource | undefined {
-  return toolingSources.get(span)
+  return toolingReporting.get(span)?.source
 }
 
 let lastLocalTraceId = 0
@@ -106,7 +156,7 @@ export function createLocalSpan(
           monotonicStartTime: options.monotonicStartTime,
           wallStartTimeMs: options.wallStartTimeMs,
         },
-        parent ? toolingSources.get(parent) : undefined
+        parent ? getToolingSpanSource(parent) : undefined
       )
       attributes = normalizeToolingAttributes(options.attributes)
     } else {
@@ -115,20 +165,67 @@ export function createLocalSpan(
       )
     }
   }
+  const delegate: LocalSpanDelegate = { span: options.delegateSpan }
+  if (options.openTelemetry) {
+    LocalRecordingSpan.startDelegate(
+      delegate,
+      options.name,
+      options.openTelemetry.options,
+      options.openTelemetry.context
+    )
+  }
+  const delegateContext = delegate.span?.spanContext()
   const span = new LocalRecordingSpan({
     name: options.name,
     attributes,
     links: options.links,
     startTime: options.startTime,
-    delegateSpan: options.delegateSpan,
+    delegate,
     publicParentSpan: options.publicParentSpan,
-    traceId: options.traceId ?? parentContext?.traceId ?? getLocalTraceId(),
-    spanId: options.spanId ?? createLocalSpanId(),
+    traceId:
+      delegateContext?.traceId ??
+      options.traceId ??
+      parentContext?.traceId ??
+      getLocalTraceId(),
+    spanId: delegateContext?.spanId ?? options.spanId ?? createLocalSpanId(),
     parentSpanId: parentContext?.spanId,
     recordSpans,
     isolateOpenTelemetry: options.isolateOpenTelemetry ?? true,
   })
-  if (source) toolingSources.set(span, source)
+  if (source) {
+    const ancestor = parent ? toolingReporting.get(parent) : undefined
+    toolingReporting.set(span, {
+      source,
+      name: options.name,
+      parent: ancestor?.token ?? ancestor?.parent,
+      selectedId: ancestor?.selectedId,
+    })
+    if (process.env.NEXT_RUNTIME !== 'edge') {
+      if (options.recordToInsights && process.env.__NEXT_DEV_SERVER) {
+        const { captureToolingSpanRecorder } =
+          require('./request-span-recorder') as typeof import('./request-span-recorder')
+        const type = attributes?.['next.span_type']
+        span.setDelivery(
+          captureToolingSpanRecorder(
+            span,
+            parent ?? undefined,
+            options.name,
+            typeof type === 'string' ? type : options.name
+          )
+        )
+      }
+      if (options.reportToOtel) {
+        span.startReporting(
+          options.reportingRoot,
+          options.endTime !== undefined ||
+            options.monotonicEndTime !== undefined
+        )
+      }
+    }
+  }
+  if (options.monotonicEndTime !== undefined)
+    span.endMonotonic(options.monotonicEndTime)
+  else if (options.endTime !== undefined) span.end(options.endTime)
   return span
 }
 
@@ -142,7 +239,7 @@ export function getLocalParentSpan(
   const store = getLocalSpanAsyncStorage().getStore()
   // Tooling has its own explicit numeric hierarchy. A request started while a
   // coarse compiler scope is active must not adopt that tooling parent.
-  if (!store || toolingSources.has(store.span)) return undefined
+  if (!store || toolingReporting.has(store.span)) return undefined
   if (isOpenTelemetryIsolatedSpan(store.span)) return store.span
 
   // An SDK span opened inside this local scope is the nearer parent.
@@ -209,9 +306,7 @@ export function withLocalSpan<T>(
 }
 
 /**
- * Records an operation without changing local or public OpenTelemetry scope.
- * Parents are explicit; request integration owns inherited parent resolution
- * and establishes its own local scope around the callback.
+ * Scope is explicit so fine observations do not change surrounding parentage.
  *
  * The default remains asynchronous, including setup errors. Explicit synchronous
  * mode ends on return/throw without awaiting a returned promise.
@@ -219,18 +314,21 @@ export function withLocalSpan<T>(
 export function traceLocalSpan<T>(
   options: (LocalSpanOptions | TraceExistingLocalSpanOptions) & {
     synchronous: true
+    scope?: boolean
   },
   fn: (span: LocalRecordingSpan) => T
 ): T
 export function traceLocalSpan<T>(
   options: (LocalSpanOptions | TraceExistingLocalSpanOptions) & {
     synchronous?: false
+    scope?: boolean
   },
   fn: (span: LocalRecordingSpan) => T | Promise<T>
 ): Promise<T>
 export function traceLocalSpan<T>(
   options: (LocalSpanOptions | TraceExistingLocalSpanOptions) & {
     synchronous?: boolean
+    scope?: boolean
   },
   fn: (span: LocalRecordingSpan) => T | Promise<T>
 ): T | Promise<T> {
@@ -242,13 +340,25 @@ export function traceLocalSpan<T>(
       // Reuse their recorder and the same callback lifecycle, not a second span.
       span = options.span
     } else {
-      span = createLocalSpan(options)
+      span = createLocalSpan({
+        ...options,
+        parent:
+          options.scope && options.parent === undefined
+            ? getActiveLocalSpan()
+            : options.parent,
+      })
     }
-    const tooling = toolingSources.has(span)
+    const tooling = toolingReporting.has(span)
     const fail = (err: unknown): never => {
       if (tooling) span.setAttribute('failed', true)
-      span.recordException(err as Error)
-      span.setStatus({ code: SPAN_STATUS_ERROR })
+      if (tooling && options.scope) {
+        const { recordSpanError } =
+          require('./tracer') as typeof import('./tracer')
+        recordSpanError(span, err as Error)
+      } else {
+        span.recordException(err as Error)
+        span.setStatus({ code: SPAN_STATUS_ERROR })
+      }
       throw err
     }
 
@@ -267,6 +377,11 @@ export function traceLocalSpan<T>(
         if (!pending) span.end()
       }
     }
+    if (options.scope) {
+      const { api } = require('./otel-api') as typeof import('./otel-api')
+      const { context, ROOT_CONTEXT } = api
+      return context.with(ROOT_CONTEXT, () => withLocalSpan(span, execute))
+    }
     return execute()
   }
 
@@ -282,12 +397,13 @@ function getLocalSpanAsyncStorage() {
 
 export class LocalRecordingSpan implements Span {
   public name: string
+  private nameUpdated = false
 
   private attributes: SpanStoreAttributes
   private events: SpanStoreEvent[]
   private readonly spanContextValue: ReturnType<Span['spanContext']>
   private readonly openTelemetryIsolated: boolean
-  private delegateSpan?: Span
+  private readonly delegate: LocalSpanDelegate
   private openTelemetrySpan: Span | undefined
   private readonly openTelemetrySpanContext: SpanContext | undefined
   private links?: SpanStoreLink[]
@@ -310,6 +426,7 @@ export class LocalRecordingSpan implements Span {
     links,
     startTime,
     delegateSpan,
+    delegate = { span: delegateSpan },
     publicParentSpan,
     traceId,
     spanId,
@@ -322,6 +439,7 @@ export class LocalRecordingSpan implements Span {
     links?: SpanOptions['links']
     startTime?: SpanOptions['startTime']
     delegateSpan?: Span
+    delegate?: LocalSpanDelegate
     publicParentSpan?: Span
     traceId: string
     spanId: string
@@ -332,11 +450,11 @@ export class LocalRecordingSpan implements Span {
     this.name = name
     this.attributes = cleanSpanStoreAttributes(attributes)
     this.events = []
-    this.delegateSpan = delegateSpan
-    this.openTelemetrySpan = delegateSpan ?? publicParentSpan
+    this.delegate = delegate
+    this.openTelemetrySpan = delegate.span ?? publicParentSpan
     this.openTelemetrySpanContext = this.openTelemetrySpan?.spanContext()
     this.openTelemetryIsolated = isolateOpenTelemetry
-    this.spanContextValue = delegateSpan?.spanContext() ?? {
+    this.spanContextValue = delegate.span?.spanContext() ?? {
       traceId,
       spanId,
       traceFlags: 0,
@@ -352,6 +470,287 @@ export class LocalRecordingSpan implements Span {
     this.ended = false
   }
 
+  startReporting(root = false, completed = false): void {
+    const reporting = toolingReporting.get(this)!
+    const { source } = reporting
+    toolingTracing!.selectToolingSpanSource(source, reporting.selectedId)
+    reporting.selectedId = source.id
+    const replay = getToolingReplay()!
+    const token = (reporting.token = replay.prepare(
+      this.delegate,
+      source.id,
+      source.parentId,
+      reporting.parent,
+      root
+    ))
+    if (token && !completed)
+      LocalRecordingSpan.deliverToolingSpan(token, this.getReportingStart())
+  }
+
+  static startDelegate(
+    delegate: LocalSpanDelegate,
+    name: string,
+    options: SpanOptions,
+    parentContext: Context,
+    canUse = canUseDelegate
+  ): void {
+    if (delegate.span || !canUse()) return
+    const { getTracerInstance } =
+      require('./otel-api') as typeof import('./otel-api')
+    const tracer = getTracerInstance()
+    if (!canUse()) return
+    const span = tracer.startSpan(name, options, parentContext)
+    if (!canUse()) return
+    delegate.span = span
+    const spanContext = span.spanContext()
+    if (!canUse()) return
+    delegate.context = spanContext
+  }
+
+  static endDelegate(
+    delegate: LocalSpanDelegate,
+    endTime?: Parameters<Span['end']>[0],
+    completion?: LocalSpanCompletion,
+    canUse = canUseDelegate
+  ): void {
+    const span = delegate.span
+    if (!span || !canUse()) return
+    if (completion?.name) {
+      span.updateName(completion.name)
+      if (!canUse()) return
+    }
+    if (completion?.attributes) {
+      span.setAttributes(completion.attributes)
+      if (!canUse()) return
+    }
+    LocalRecordingSpan.deliverEvents(delegate, completion?.events ?? [], canUse)
+    if (!canUse()) return
+    if (completion?.status) {
+      span.setStatus(completion.status)
+      if (!canUse()) return
+    }
+    try {
+      span.end(endTime)
+    } finally {
+      if (delegate.span === span) delegate.span = undefined
+    }
+  }
+
+  static deliverEvents(
+    delegate: LocalSpanDelegate,
+    events: SpanStoreEvent[],
+    canUse = canUseDelegate
+  ): void {
+    for (let i = delegate.eventsForwarded ?? 0; i < events.length; i++) {
+      if (!delegate.span || !canUse()) return
+      const event = events[i]
+      delegate.span.addEvent(event.name, event.attributes, event.timestamp)
+      if (!canUse()) return
+      delegate.eventsForwarded = i + 1
+    }
+  }
+
+  static clearReporting(): void {
+    for (const item of pendingReporting.values())
+      toolingReplay!.releaseSnapshot(item)
+    pendingReporting.clear()
+  }
+
+  static deliverToolingSpan(
+    token?: ReportingToken,
+    start?: ReportingStart,
+    completion?: ReportingCompletion
+  ): void {
+    const replay = getToolingReplay()!
+    if (token && start) {
+      if (!replay.isCurrent(token)) return
+      if (!replay.isReady(token) || delivering) {
+        const item = replay.snapshot(
+          token,
+          start,
+          completion,
+          pendingReporting.get(token)
+        )
+        if (item) pendingReporting.set(token, item)
+        if (replay.isReady(token) && !delivering)
+          LocalRecordingSpan.deliverToolingSpan()
+        return
+      }
+    }
+    if (delivering) return
+    delivering = true
+    try {
+      if (token && start)
+        LocalRecordingSpan.emitToolingSpan(token, start, completion)
+      while (pendingReporting.size) {
+        const item =
+          pendingReporting.get(replay.getRoot()!) ??
+          pendingReporting.values().next().value!
+        if (replay.isCurrent(item.token) && !replay.isReady(item.token)) break
+        pendingReporting.delete(item.token)
+        replay.releaseSnapshot(item)
+        LocalRecordingSpan.emitToolingSpan(
+          item.token,
+          item.start,
+          item.completion
+        )
+      }
+    } finally {
+      delivering = false
+    }
+  }
+
+  private static emitToolingSpan(
+    token: ReportingToken,
+    start: ReportingStart,
+    completion?: ReportingCompletion
+  ): void {
+    const replay = toolingReplay!
+    const canUse = () => replay.isReady(token)
+    if (!canUse()) return
+    try {
+      const { api } = require('./otel-api') as typeof import('./otel-api')
+      const parent = replay.parentContext(token)
+      const context = parent
+        ? api.trace.setSpanContext(api.ROOT_CONTEXT, parent)
+        : api.ROOT_CONTEXT
+      const metricsOnly =
+        start.name === 'memory-usage' ||
+        start.name === 'server-restart-close-to-memory-threshold'
+      const completedAtStart = !!completion && !token.span
+      const attributes = Object.fromEntries(
+        Object.entries(completion?.attributes ?? {}).map(([key, value]) => [
+          key,
+          Array.isArray(value) ? JSON.stringify(value) : value,
+        ])
+      )
+      if (!canUse()) return
+      if (!metricsOnly && !token.span) {
+        LocalRecordingSpan.startDelegate(
+          token,
+          completion?.name ?? start.name,
+          {
+            startTime: toHrTime(start.start),
+            links: start.links,
+            attributes: {
+              'next.tooling.id': token.id,
+              ...(start.parentId === undefined
+                ? {}
+                : { 'next.tooling.parent_id': start.parentId }),
+              ...(completion ? attributes : undefined),
+            },
+          },
+          context,
+          canUse
+        )
+      }
+      if (!completion || !canUse()) return
+      const metricParent = token.context ?? parent ?? replay.getRoot()?.context
+      LocalRecordingSpan.reportMeasurements(
+        start.name,
+        attributes,
+        metricParent
+          ? api.trace.setSpanContext(api.ROOT_CONTEXT, metricParent)
+          : context,
+        canUse
+      )
+      if (!canUse()) return
+      LocalRecordingSpan.endDelegate(
+        token,
+        toHrTime(completion.end),
+        {
+          ...completion,
+          name: completedAtStart ? undefined : completion.name,
+          attributes: completedAtStart ? undefined : attributes,
+          status:
+            completion.status ??
+            (attributes.failed === true
+              ? { code: SPAN_STATUS_ERROR }
+              : undefined),
+        },
+        canUse
+      )
+      if (canUse()) replay.finish(token)
+    } catch {
+      replay.finish(token, true)
+    }
+  }
+
+  private static reportMeasurements(
+    name: string,
+    attributes: Attributes,
+    context: Context,
+    canUse: () => boolean
+  ): void {
+    const restart = name === 'server-restart-close-to-memory-threshold'
+    const native =
+      name === 'turbopack-persistence' || name === 'turbopack-compaction'
+    if (!native && name !== 'memory-usage' && !restart) return
+    const { api } = require('./otel-api') as typeof import('./otel-api')
+    const meter = api.metrics.getMeter('next.js', process.env.__NEXT_VERSION)
+    const measurements = native
+      ? [
+          ['bytes_written', 'turbopack.bytes_written', 'By'],
+          ['bytes_deleted', 'turbopack.bytes_deleted', 'By'],
+          ['task_count', 'turbopack.task_count', '{task}'],
+        ]
+      : [
+          ['memory.rss', 'memory.rss', 'By'],
+          ['memory.heapUsed', 'memory.heap_used', 'By'],
+          ['memory.heapTotal', 'memory.heap_total', 'By'],
+          ['memory.heapMax', 'memory.heap_limit', 'By'],
+          ['memory.heapSizeLimit', 'memory.heap_limit', 'By'],
+        ]
+    for (const [key, suffix, unit] of measurements) {
+      if (attributes[key] === undefined) continue
+      const value = Number(attributes[key])
+      if (!Number.isFinite(value) || value < 0 || !canUse()) continue
+      const histogram = meter.createHistogram(`next.tooling.${suffix}`, {
+        unit,
+      })
+      if (!canUse()) return
+      histogram.record(value, { operation: name }, context)
+    }
+    if (restart && canUse())
+      meter
+        .createCounter('next.tooling.server.restarts', { unit: '{restart}' })
+        .add(1, { reason: 'memory-threshold' }, context)
+  }
+
+  private getReportingStart(): ReportingStart {
+    const { source, name } = toolingReporting.get(this)!
+    return {
+      name,
+      parentId: source.parentId,
+      start: toolingReplay!.epochTime(source.startTime),
+      links: this.delegate.span
+        ? undefined
+        : this.links?.map(({ traceId, spanId, attributes }) => ({
+            context: { traceId, spanId, traceFlags: 0 },
+            attributes,
+          })),
+    }
+  }
+
+  private updateDelegate(update: (span: Span) => void): void {
+    const span = this.delegate.span
+    const token = toolingReporting.get(this)?.token
+    if (!span || (token && !toolingReplay!.isReady(token))) return
+    if (!toolingReporting.has(this)) {
+      update(span)
+      return
+    }
+    try {
+      update(span)
+    } catch {
+      this.delegate.onError?.()
+    }
+  }
+
+  setDelivery(deliver: LocalSpanDelivery): void {
+    this.recordSpans = deliver
+  }
+
   spanContext(): ReturnType<Span['spanContext']> {
     return this.spanContextValue
   }
@@ -362,27 +761,30 @@ export class LocalRecordingSpan implements Span {
 
   getOpenTelemetrySpan(): Span | undefined {
     return (
+      this.delegate.span ??
       this.openTelemetrySpan ??
-      (this.openTelemetrySpanContext
+      ((this.delegate.context ?? this.openTelemetrySpanContext)
         ? (
-            require('next/dist/compiled/@opentelemetry/api') as typeof import('next/dist/compiled/@opentelemetry/api')
-          ).trace.wrapSpanContext(this.openTelemetrySpanContext)
+            require('./otel-api') as typeof import('./otel-api')
+          ).api.trace.wrapSpanContext(
+            (this.delegate.context ?? this.openTelemetrySpanContext)!
+          )
         : undefined)
     )
   }
 
   setAttribute(key: string, value: AttributeValue): this {
-    if (this.ended && !toolingSources.has(this)) {
+    if (this.ended && !toolingReporting.has(this)) {
       return this
     }
 
     this.attributes[key] = value
-    this.delegateSpan?.setAttribute(key, value)
+    this.updateDelegate((span) => span.setAttribute(key, value))
     return this
   }
 
   setAttributes(attributes: Parameters<Span['setAttributes']>[0]): this {
-    if (this.ended && !toolingSources.has(this)) {
+    if (this.ended && !toolingReporting.has(this)) {
       return this
     }
 
@@ -394,7 +796,7 @@ export class LocalRecordingSpan implements Span {
         this.attributes[key] = value
       }
     }
-    this.delegateSpan?.setAttributes(attributes)
+    this.updateDelegate((span) => span.setAttributes(attributes))
     return this
   }
 
@@ -418,7 +820,15 @@ export class LocalRecordingSpan implements Span {
         ? cleanSpanStoreAttributes(attributesOrStartTime)
         : undefined,
     })
-    this.delegateSpan?.addEvent(name, attributesOrStartTime, startTime)
+    if (!toolingReporting.has(this)) {
+      this.delegate.span?.addEvent(name, attributesOrStartTime, startTime)
+    } else {
+      this.updateDelegate(() =>
+        LocalRecordingSpan.deliverEvents(this.delegate, this.events, () =>
+          toolingReplay!.isReady(toolingReporting.get(this)!.token!)
+        )
+      )
+    }
     return this
   }
 
@@ -429,7 +839,7 @@ export class LocalRecordingSpan implements Span {
 
     this.statusCode = status.code
     this.statusMessage = status.message
-    this.delegateSpan?.setStatus(status)
+    this.updateDelegate((span) => span.setStatus(status))
     return this
   }
 
@@ -439,7 +849,8 @@ export class LocalRecordingSpan implements Span {
     }
 
     this.name = name
-    this.delegateSpan?.updateName(name)
+    this.nameUpdated = true
+    this.updateDelegate((span) => span.updateName(name))
     return this
   }
 
@@ -448,12 +859,21 @@ export class LocalRecordingSpan implements Span {
       return
     }
 
+    this.finish(endTime)
+  }
+
+  private finish(
+    endTime?: Parameters<Span['end']>[0],
+    monotonicEndTime?: bigint
+  ): void {
+    if (this.ended) return
     this.ended = true
     try {
-      this.delegateSpan?.end(endTime)
+      if (!toolingReporting.has(this))
+        LocalRecordingSpan.endDelegate(this.delegate, endTime)
     } finally {
       try {
-        this.record(endTime)
+        this.record(endTime, monotonicEndTime)
       } finally {
         this.releaseReferences()
       }
@@ -478,26 +898,65 @@ export class LocalRecordingSpan implements Span {
       timestamp: getTimestamp(time),
       attributes: getSpanStoreExceptionAttributes(this.exception),
     })
-    this.delegateSpan?.recordException(exception, time)
+    if (!toolingReporting.has(this)) {
+      this.delegate.span?.recordException(exception, time)
+    } else {
+      this.updateDelegate(() =>
+        LocalRecordingSpan.deliverEvents(this.delegate, this.events, () =>
+          toolingReplay!.isReady(toolingReporting.get(this)!.token!)
+        )
+      )
+    }
   }
 
-  private record(endTime: Parameters<Span['end']>[0]): void {
+  endMonotonic(endTime: bigint): void {
+    this.finish(undefined, endTime)
+  }
+
+  private record(
+    endTime: Parameters<Span['end']>[0],
+    monotonicEndTime?: bigint
+  ): void {
     let completedAt = getTimestamp(endTime)
     let startTime = this.startTime
-    const source = toolingSources.get(this)
+    const source = toolingReporting.get(this)?.source
     if (source && process.env.NEXT_RUNTIME !== 'edge') {
-      const { completeToolingSpan } = (toolingTracing ??=
+      const { completeToolingSpan, getToolingSpanEndTime } = (toolingTracing ??=
         require('../../../trace/trace') as typeof import('../../../trace/trace'))
-      const event = completeToolingSpan(
-        source,
-        this.name,
-        this.attributes,
-        endTime
-      )
+      const stopTime = monotonicEndTime ?? getToolingSpanEndTime(endTime)
+      let event: ReturnType<typeof completeToolingSpan>
+      try {
+        event = completeToolingSpan(
+          source,
+          this.name,
+          this.attributes,
+          endTime,
+          stopTime
+        )
+      } finally {
+        const token = toolingReporting.get(this)?.token
+        if (token && toolingReplay) {
+          LocalRecordingSpan.deliverToolingSpan(
+            token,
+            this.getReportingStart(),
+            {
+              end: toolingReplay.epochTime(stopTime),
+              attributes: this.attributes,
+              name: this.nameUpdated ? this.name : undefined,
+              events: this.events.length ? this.events : undefined,
+              status:
+                this.statusCode === undefined
+                  ? undefined
+                  : {
+                      code: this.statusCode,
+                      message: this.statusMessage,
+                    },
+            }
+          )
+        }
+      }
       startTime = source.wallStartTimeMs
       completedAt = startTime + event.duration / 1000
-      this.recordSpans = source.recordSpans
-      source.recordSpans = undefined
       if (!this.recordSpans) return
     }
     const recordAttributes =
@@ -531,12 +990,12 @@ export class LocalRecordingSpan implements Span {
     // primitive timing/identity fields needed by the Span API after end.
     // Legacy saved tooling events retain the normalized tag object and permit
     // late attribute writes. Request spans release it and ignore later writes.
-    if (!toolingSources.has(this)) {
+    if (!toolingReporting.has(this)) {
       this.name = ''
       this.attributes = {}
     }
     this.events = []
-    this.delegateSpan = undefined
+    if (!toolingReporting.has(this)) this.delegate.span = undefined
     this.openTelemetrySpan = undefined
     this.links = undefined
     this.recordSpans = undefined
@@ -592,24 +1051,6 @@ function cleanSpanStoreAttributes(
     }
   }
   return cleanedAttributes
-}
-
-function getTimestamp(time?: SpanOptions['startTime']): number {
-  if (time instanceof Date) {
-    return time.getTime()
-  }
-
-  if (Array.isArray(time)) {
-    return time[0] * 1000 + time[1] / 1_000_000
-  }
-
-  if (typeof time === 'number') {
-    return time < performance.timeOrigin / 2
-      ? performance.timeOrigin + time
-      : time
-  }
-
-  return performance.timeOrigin + performance.now()
 }
 
 function getStringAttribute(

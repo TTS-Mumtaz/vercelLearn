@@ -101,7 +101,12 @@ export function captureToolingSpanRecorder(
 
 type RequestSpanOptions = Omit<
   LocalSpanOptions,
-  'attributes' | 'monotonicStartTime' | 'wallStartTimeMs'
+  | 'attributes'
+  | 'monotonicStartTime'
+  | 'wallStartTimeMs'
+  | 'reportToOtel'
+  | 'recordToInsights'
+  | 'reportingRoot'
 > & {
   attributes?: Partial<Record<string, AttributeValue | undefined>>
 }

@@ -1149,6 +1149,7 @@ export default async function exportApp(
 ): Promise<ExportAppResult | null> {
   const nextExportSpan = createLocalSpan({
     name: 'next-export',
+    reportToOtel: true,
     parent: span,
   })
 

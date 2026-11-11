@@ -1,7 +1,7 @@
+import { traceLocalSpan } from '../server/lib/trace/local-span-recorder'
 import type { NextConfigComplete } from '../server/config-shared'
 import type { Telemetry } from '../telemetry/storage'
 import type { Span } from '@opentelemetry/api'
-import { getTracer } from '../server/lib/trace/tracer'
 import { ToolingSpan } from '../server/lib/trace/constants'
 
 import * as Log from './output/log'
@@ -135,9 +135,14 @@ export async function startTypeChecking({
   const typeCheckAndLintStart = process.hrtime()
 
   try {
-    const [verifyResult, typeCheckEnd] = await getTracer().trace(
-      ToolingSpan.runTypeScript,
-      { parent: nextBuildSpan },
+    const [verifyResult, typeCheckEnd] = await traceLocalSpan(
+      {
+        name: ToolingSpan.runTypeScript,
+        reportToOtel: true,
+        recordToInsights: true,
+        scope: true,
+        parent: nextBuildSpan,
+      },
       () =>
         verifyAndRunTypeScript(
           dir,

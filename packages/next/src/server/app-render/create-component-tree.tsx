@@ -90,9 +90,7 @@ export function createComponentTree(
 
   return getTracer().trace(
     NextNodeServerSpan.createComponentTree,
-    {
-      spanName: 'build component tree',
-    },
+    { reportToOtel: true, spanName: 'build component tree' },
     () => createComponentTreeInternal(props, true, workUnitStore)
   )
 }
@@ -250,6 +248,7 @@ async function createComponentTreeInternal(
   const { mod: layoutOrPageMod, modType } = await getTracer().trace(
     NextNodeServerSpan.getLayoutOrPageModule,
     {
+      reportToOtel: true,
       hideSpan: !(isLayout || isPage),
       spanName: 'resolve segment modules',
       attributes: {

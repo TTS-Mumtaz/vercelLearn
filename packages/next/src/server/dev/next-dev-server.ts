@@ -547,6 +547,7 @@ export default class DevServer extends Server {
                 [
                   {
                     name: 'render-path',
+                    reportToOtel: true,
                     startTime: hrtimeToEpochNanoseconds(
                       devRequestTimingInternalsEnd
                     ),
@@ -583,6 +584,7 @@ export default class DevServer extends Server {
     const memoryUsage = process.memoryUsage()
     createLocalSpan({
       name: 'memory-usage',
+      reportToOtel: true,
       parent: span,
       attributes: {
         url: req.url,

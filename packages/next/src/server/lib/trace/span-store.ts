@@ -12,6 +12,8 @@ export type ToolingSpanObservation = {
   startTime?: bigint
   endTime?: bigint
   attributes?: Record<string, unknown>
+  reportToOtel?: boolean
+  recordToInsights?: boolean
 }
 import type {
   RequestInsightKind,
@@ -128,81 +130,50 @@ export function recordSpans(
       ]
 ): void {
   if (args.length === 3) {
-    if (process.env.NEXT_RUNTIME !== 'edge') {
-      const {
-        captureToolingSpanSource,
-        completeToolingSpan,
-        normalizeToolingAttributes,
-        toolingSpanTime,
-      } = (toolingTracing ??=
+    if (process.env.NEXT_RUNTIME === 'edge') {
+      return
+    } else {
+      const { getToolingClock } = (toolingTracing ??=
         require('../../../trace/trace') as typeof import('../../../trace/trace'))
-      const { getToolingSpanSource } = (toolingRecorder ??=
+      const { createLocalSpan } = (toolingRecorder ??=
         require('./local-span-recorder') as typeof import('./local-span-recorder'))
-      const parent = args[2] ? getToolingSpanSource(args[2]) : undefined
       const nsPerMs = BigInt(1_000_000)
       for (const observation of args[0]) {
         // Native events arrive after completion. Preserve their original wall
         // start and map both endpoints to the local monotonic clock together.
-        const correction =
-          process.hrtime.bigint() - BigInt(Date.now()) * nsPerMs
-        if (observation.name === 'client-hmr-latency') {
-          const span = toolingRecorder.createLocalSpan({
-            name: observation.name,
-            startTime: observation.startTime
-              ? Number(observation.startTime / nsPerMs)
-              : undefined,
-            attributes: observation.attributes,
-            parent: args[2],
-            monotonicStartTime: observation.startTime
+        const clock = getToolingClock()
+        const correction = clock.monotonic - BigInt(clock.wallTimeMs) * nsPerMs
+        const timing = {
+          monotonicStartTime:
+            observation.startTime !== undefined
               ? observation.startTime + correction
-              : undefined,
-            wallStartTimeMs: observation.startTime
+              : clock.monotonic,
+          wallStartTimeMs:
+            observation.startTime !== undefined
               ? Number(observation.startTime / nsPerMs)
-              : undefined,
-          })
-          if (process.env.__NEXT_DEV_SERVER) {
-            const { captureToolingSpanRecorder } =
-              require('./request-span-recorder') as typeof import('./request-span-recorder')
-            getToolingSpanSource(span)!.recordSpans =
-              captureToolingSpanRecorder(
-                span,
-                undefined,
-                observation.name,
-                observation.name
-              )
-          }
-          span.end(
-            observation.endTime
-              ? toolingSpanTime(observation.endTime + correction)
-              : undefined
-          )
-          continue
+              : clock.wallTimeMs,
         }
-        const source = captureToolingSpanSource(
-          {
-            monotonicStartTime: observation.startTime
-              ? observation.startTime + correction
-              : undefined,
-            wallStartTimeMs: observation.startTime
-              ? Number(observation.startTime / nsPerMs)
-              : undefined,
-          },
-          parent
-        )
-        completeToolingSpan(
-          source,
-          observation.name,
-          normalizeToolingAttributes(observation.attributes),
-          observation.endTime
-            ? toolingSpanTime(observation.endTime + correction)
-            : undefined
-        )
+        const monotonicEndTime =
+          observation.endTime !== undefined
+            ? observation.endTime + correction
+            : clock.monotonic
+        createLocalSpan({
+          name: observation.name,
+          attributes: observation.attributes,
+          parent: args[2],
+          reportToOtel: observation.reportToOtel,
+          recordToInsights: observation.recordToInsights,
+          ...timing,
+          monotonicEndTime,
+        })
       }
     }
   } else if (args.length === 2) {
     // Tooling observations go straight to files in builds as well as dev, never
     // into the request sink/history or an application SDK provider.
-    if (process.env.NEXT_RUNTIME !== 'edge') {
+    if (process.env.NEXT_RUNTIME === 'edge') {
+      return
+    } else {
       const { reportToolingSpans } = (toolingTracing ??=
         require('../../../trace/trace') as typeof import('../../../trace/trace'))
       reportToolingSpans(args[0])

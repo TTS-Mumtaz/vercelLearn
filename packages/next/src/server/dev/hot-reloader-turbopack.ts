@@ -61,9 +61,12 @@ import {
   clearModuleContext,
 } from '../lib/render-server'
 import { denormalizePagePath } from '../../shared/lib/page-path/denormalize-page-path'
-import { getTracer } from '../lib/trace/tracer'
 import { ToolingSpan } from '../lib/trace/constants'
-import { traceLocalSpan } from '../lib/trace/local-span-recorder'
+import {
+  traceLocalSpan,
+  createLocalSpan,
+  getActiveLocalSpan,
+} from '../lib/trace/local-span-recorder'
 import { recordSpans } from '../lib/trace/span-store'
 import {
   AssetMapper,
@@ -474,7 +477,11 @@ export async function createHotReloaderTurbopack(
     opts.fsChecker.rewrites.beforeFiles.length > 0 ||
     opts.fsChecker.rewrites.fallback.length > 0
 
-  const hotReloaderSpan = getTracer().startSpan(ToolingSpan.hotReloader, {
+  const hotReloaderSpan = createLocalSpan({
+    name: ToolingSpan.hotReloader,
+    parent: getActiveLocalSpan(),
+    reportToOtel: true,
+    recordToInsights: true,
     attributes: { version: process.env.__NEXT_VERSION as string },
   })
   // Ensure the hotReloaderSpan is flushed immediately as it's the parentSpan for all processing
@@ -1737,6 +1744,7 @@ export async function createHotReloaderTurbopack(
                 [
                   {
                     name: parsedData.spanName,
+                    reportToOtel: parsedData.reportToOtel === true,
                     startTime: msToNs(parsedData.startTime),
                     endTime: msToNs(parsedData.endTime),
                     attributes: parsedData.attributes,
@@ -1752,6 +1760,8 @@ export async function createHotReloaderTurbopack(
                 [
                   {
                     name: parsedData.event,
+                    reportToOtel: parsedData.reportToOtel === true,
+                    recordToInsights: true,
                     startTime: msToNs(parsedData.startTime),
                     endTime: msToNs(parsedData.endTime),
                     attributes: {

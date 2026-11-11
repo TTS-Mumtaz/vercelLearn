@@ -2514,6 +2514,7 @@ function initializeClientComponentLoadTracking(
       ) {
         getTracer()
           .startSpan(NextNodeServerSpan.clientComponentLoading, {
+            reportToOtel: true,
             parentSpan,
             startTime: metrics.clientComponentLoadStart,
             attributes: {
@@ -2711,6 +2712,7 @@ async function prerenderAppPage({
   const prerenderToStreamWithTracing = getTracer().wrap(
     AppRenderSpan.getBodyResult,
     {
+      reportToOtel: true,
       spanName: `prerender route (app) ${pagePath}`,
       attributes: {
         'next.route': pagePath,
@@ -3678,6 +3680,7 @@ async function renderToStream(
   const renderSpan = getTracer().startSpan(
     `render route (app) ${pagePath}` as any,
     {
+      reportToOtel: true,
       attributes: {
         'next.span_name': `render route (app) ${pagePath}`,
         'next.span_type': AppRenderSpan.getBodyResult,

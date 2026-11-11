@@ -872,6 +872,7 @@ export async function renderToHTMLImpl(
       data = await getTracer().trace(
         RenderSpan.getStaticProps,
         {
+          reportToOtel: true,
           spanName: `getStaticProps ${pathname}`,
           attributes: {
             'next.route': pathname,
@@ -1092,6 +1093,7 @@ export async function renderToHTMLImpl(
       data = await getTracer().trace(
         RenderSpan.getServerSideProps,
         {
+          reportToOtel: true,
           spanName: `getServerSideProps ${pathname}`,
           attributes: {
             'next.route': pathname,
@@ -1443,6 +1445,7 @@ export async function renderToHTMLImpl(
   const documentResult = await getTracer().trace(
     RenderSpan.renderDocument,
     {
+      reportToOtel: true,
       spanName: `render route (pages) ${renderOpts.page}`,
       attributes: {
         'next.route': renderOpts.page,

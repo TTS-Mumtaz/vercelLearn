@@ -320,6 +320,7 @@ export class AppRouteRouteModule extends RouteModule<
         getTracer().trace(
           AppRouteRouteModuleSpan.loadUserland,
           {
+            reportToOtel: true,
             spanName: 'load app route module',
             attributes: {
               'next.route': this.definition.pathname,
@@ -1022,6 +1023,7 @@ export class AppRouteRouteModule extends RouteModule<
             return tracer.trace(
               AppRouteRouteHandlersSpan.runHandler,
               {
+                reportToOtel: true,
                 spanName: `executing api route (app) ${pathname}`,
                 attributes: {
                   'next.route': pathname,
@@ -1104,6 +1106,7 @@ export class AppRouteRouteModule extends RouteModule<
             return tracer.trace(
               AppRouteRouteHandlersSpan.runHandler,
               {
+                reportToOtel: true,
                 spanName: `executing api route (app) ${pathname}`,
                 attributes: {
                   'next.route': pathname,

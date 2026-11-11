@@ -784,6 +784,7 @@ export default class NextNodeServer extends BaseServer<
     return getTracer().trace(
       NextNodeServerSpan.findPageComponents,
       {
+        reportToOtel: true,
         spanName: 'resolve page components',
         attributes: {
           'next.route': isAppPath ? normalizeAppPath(page) : page,

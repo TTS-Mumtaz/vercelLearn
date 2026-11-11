@@ -73,9 +73,7 @@ function createWriterFromResponse(
         res.flushHeaders()
         getTracer().trace(
           NextNodeServerSpan.startResponse,
-          {
-            spanName: 'start response',
-          },
+          { reportToOtel: true, spanName: 'start response' },
           () => undefined
         )
       }
@@ -233,9 +231,7 @@ export async function pipeNodeReadableToNodeResponse(
         res.flushHeaders()
         getTracer().trace(
           NextNodeServerSpan.startResponse,
-          {
-            spanName: 'start response',
-          },
+          { reportToOtel: true, spanName: 'start response' },
           () => undefined
         )
       }

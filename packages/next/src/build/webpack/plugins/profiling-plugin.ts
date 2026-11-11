@@ -4,7 +4,6 @@ import {
   createLocalSpan,
   type LocalRecordingSpan,
 } from '../../../server/lib/trace/local-span-recorder'
-import { getTracer } from '../../../server/lib/trace/tracer'
 import { ToolingSpan } from '../../../server/lib/trace/constants'
 import { normalizeToolingAttributes } from '../../../trace/trace'
 import type { webpack } from 'next/dist/compiled/webpack/webpack'
@@ -59,11 +58,13 @@ export class ProfilingPlugin {
     stopHook: any,
     {
       parentSpan,
+      reportToOtel = false,
       attrs,
       onStart,
       onStop,
     }: {
       parentSpan?: (...params: any[]) => Span
+      reportToOtel?: boolean
       attrs?: any
       onStart?: (span: Span, ...params: any[]) => void
       onStop?: (span: Span, ...params: any[]) => void
@@ -77,6 +78,7 @@ export class ProfilingPlugin {
         const attributes = attrs ? attrs(...params) : attrs
         span = createLocalSpan({
           name,
+          reportToOtel,
           parent: parentSpan ? parentSpan(...params) : this.runWebpackSpan,
           attributes,
         })
@@ -102,13 +104,13 @@ export class ProfilingPlugin {
     compiler.hooks.compilation.tap(
       { name: pluginName, stage: -Infinity },
       (compilation: webpack.Compilation) => {
-        compilationSpan = getTracer().startSpan(
-          ToolingSpan.webpackCompilation,
-          {
-            parent: webpackInvalidSpans.get(compiler) || this.runWebpackSpan,
-            attributes: normalizeToolingAttributes({ name: compiler.name }),
-          }
-        )
+        compilationSpan = createLocalSpan({
+          name: ToolingSpan.webpackCompilation,
+          reportToOtel: true,
+          recordToInsights: true,
+          parent: webpackInvalidSpans.get(compiler) || this.runWebpackSpan,
+          attributes: normalizeToolingAttributes({ name: compiler.name }),
+        })
         spans.set(compilation, compilationSpan)
         spans.set(compiler, compilationSpan)
         moduleSpansByCompilation.set(compilation, new WeakMap())
@@ -123,20 +125,20 @@ export class ProfilingPlugin {
       compiler.hooks.invalid.tap(
         { name: pluginName, stage: -Infinity },
         (fileName: string | null) => {
-          invalidationSpan = getTracer().startSpan(
-            ToolingSpan.webpackInvalidated,
-            {
-              spanName: `webpack-invalidated-${compiler.name}`,
-              parent: this.runWebpackSpan,
-              attributes: {
-                trigger: fileName
-                  ? path
-                      .relative(this.rootDir, fileName)
-                      .replaceAll(path.sep, '/')
-                  : 'manual',
-              },
-            }
-          )
+          invalidationSpan = createLocalSpan({
+            name: `webpack-invalidated-${compiler.name}`,
+            reportToOtel: true,
+            recordToInsights: true,
+            parent: this.runWebpackSpan,
+            attributes: {
+              'next.span_type': ToolingSpan.webpackInvalidated,
+              trigger: fileName
+                ? path
+                    .relative(this.rootDir, fileName)
+                    .replaceAll(path.sep, '/')
+                : 'manual',
+            },
+          })
           webpackInvalidSpans.set(compiler, invalidationSpan)
         }
       )
@@ -156,6 +158,7 @@ export class ProfilingPlugin {
     })
 
     this.traceHookPair('make', compiler.hooks.make, compiler.hooks.finishMake, {
+      reportToOtel: true,
       parentSpan: (compilation) => {
         const compilationSpan = spans.get(compilation)
         if (!compilationSpan) {
@@ -266,6 +269,7 @@ export class ProfilingPlugin {
           compilation.hooks.seal,
           compilation.hooks.afterSeal,
           {
+            reportToOtel: true,
             parentSpan: () => spans.get(compilation)!,
             onStart(span) {
               sealSpanByCompilation.set(compilation, span)
@@ -304,6 +308,7 @@ export class ProfilingPlugin {
           compilation.hooks.beforeChunks,
           compilation.hooks.afterChunks,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -313,6 +318,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimize,
           compilation.hooks.reviveModules,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -322,6 +328,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeModules,
           compilation.hooks.afterOptimizeModules,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -331,6 +338,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeChunks,
           compilation.hooks.afterOptimizeChunks,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -340,6 +348,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeTree,
           compilation.hooks.afterOptimizeTree,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -349,6 +358,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeChunkModules,
           compilation.hooks.afterOptimizeChunkModules,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -358,6 +368,7 @@ export class ProfilingPlugin {
           compilation.hooks.beforeModuleHash,
           compilation.hooks.afterModuleHash,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }

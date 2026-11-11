@@ -28,9 +28,7 @@ export function wrapApiHandler<T extends (...args: any[]) => any>(
     // Call API route method
     return getTracer().trace(
       NodeSpan.runHandler,
-      {
-        spanName: `executing api route (pages) ${page}`,
-      },
+      { reportToOtel: true, spanName: `executing api route (pages) ${page}` },
       () => handler(...args)
     )
   }) as T
