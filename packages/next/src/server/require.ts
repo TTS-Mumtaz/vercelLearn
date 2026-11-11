@@ -29,6 +29,16 @@ export function getMaybePagePath(
   // If we have a cached path, we can return it directly.
   if (pagePath) return pagePath
 
+  // `null` is stored below for a page that neither manifest has. Outside of a
+  // dev server the manifests are loaded once and frozen, so looking again
+  // gives the same answer, and it is returned here. A dev server compiles
+  // pages on demand and reloads its manifests, so a page that was missing can
+  // exist a moment later: there the lookup is always redone. The cache also
+  // exists in a dev server that runs with a `NODE_ENV` other than
+  // `development`, hence the second check, which is read on every call
+  // because the variable is set when the dev server starts.
+  if (pagePath === null && !process.env.__NEXT_DEV_SERVER) return null
+
   const serverBuildPath = path.join(
     /* turbopackIgnore: true */ distDir,
     SERVER_DIRECTORY
@@ -95,6 +105,24 @@ export function getMaybePagePath(
 
   pagePathCache?.set(cacheKey, pagePath)
   return pagePath
+}
+
+/**
+ * Whether `getMaybePagePath` has stored that a page is in no manifest and
+ * answers `null` for it without looking again. Never the case in a dev
+ * server, where a page that was missing can exist a moment later.
+ */
+export function isPagePathStoredMiss(
+  page: string,
+  distDir: string,
+  locales: readonly string[] | undefined,
+  isAppPath: boolean
+): boolean {
+  if (!pagePathCache || process.env.__NEXT_DEV_SERVER) return false
+
+  return (
+    pagePathCache.get(`${page}:${distDir}:${locales}:${isAppPath}`) === null
+  )
 }
 
 export function getPagePath(
