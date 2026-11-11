@@ -1,7 +1,7 @@
 import path from 'path'
 import { validateTurboNextConfig } from '../../lib/turbopack-warning'
 import { seedTurbopackCacheIfNeeded } from '../../lib/turbopack-cache-seed'
-import { NextBuildContext } from '../build-context'
+import { NextBuildContext, RETAINED_DIST_DIR_ENTRIES } from '../build-context'
 import { createDefineEnv, getBindingsSync } from '../swc'
 import {
   handleRouteType,
@@ -171,16 +171,26 @@ export async function turbopackBuild(telemetry: Telemetry): Promise<{
     printBuildErrors(projectResult, dev)
 
     // Write an empty file in a known location to signal this was built with Turbopack
-    await fs.writeFile(path.join(distDir, 'turbopack'), '')
+    const distDirWritesBeforeTurbopack =
+      NextBuildContext.distDirWritesBeforeTurbopack
+    const turbopackMarkerPath = path.join(distDir, 'turbopack')
+    await fs.writeFile(turbopackMarkerPath, '')
 
-    await fs.mkdir(path.join(distDir, 'server'), { recursive: true })
-    await fs.mkdir(path.join(distDir, 'static', buildId), {
+    const serverDir = path.join(distDir, 'server')
+    const staticBuildIdDir = path.join(distDir, 'static', buildId)
+    await fs.mkdir(serverDir, { recursive: true })
+    await fs.mkdir(staticBuildIdDir, {
       recursive: true,
     })
-    await fs.writeFile(
-      path.join(distDir, 'package.json'),
-      '{"type": "commonjs"}'
-    )
+    const packageJsonPath = path.join(distDir, 'package.json')
+    await fs.writeFile(packageJsonPath, '{"type": "commonjs"}')
+    if (distDirWritesBeforeTurbopack) {
+      distDirWritesBeforeTurbopack.add(turbopackMarkerPath)
+      distDirWritesBeforeTurbopack.add(serverDir)
+      distDirWritesBeforeTurbopack.add(path.dirname(staticBuildIdDir))
+      distDirWritesBeforeTurbopack.add(staticBuildIdDir)
+      distDirWritesBeforeTurbopack.add(packageJsonPath)
+    }
 
     let appDirOnly = NextBuildContext.appDirOnly!
 
@@ -192,6 +202,28 @@ export async function turbopackBuild(telemetry: Telemetry): Promise<{
       strictRouteMatchingDefaultWarning:
         getStrictRouteMatchingDefaultWarning(config),
     })
+
+    if (distDirWritesBeforeTurbopack) {
+      // The distDir wasn't cleaned before the build. Now that Turbopack has
+      // written all output, remove everything it didn't write (output of
+      // previous builds), except for what JS wrote so far. Everything written
+      // after this point needs no tracking. This runs before any later build
+      // step reads the distDir, so they observe the same files as after a
+      // clean build.
+      await NextBuildContext.nextBuildSpan!.traceChild(
+        'remove-stale-output'
+      ).traceAsyncFn(async (span) => {
+        const { removedFiles, removedDirectories } =
+          await project.removeStaleOutput({
+            skip: [...RETAINED_DIST_DIR_ENTRIES],
+            keep: [...distDirWritesBeforeTurbopack].map((p) =>
+              normalizePath(path.relative(distDir, p))
+            ),
+          })
+        span.setAttribute('removedFiles', String(removedFiles))
+        span.setAttribute('removedDirectories', String(removedDirectories))
+      })
+    }
 
     // Skip when telemetry is fully off — featureUsage() isn't free.
     if (telemetry.isEnabled || process.env.NEXT_TELEMETRY_DEBUG) {

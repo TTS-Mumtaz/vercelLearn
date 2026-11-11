@@ -17,6 +17,8 @@ import type {
   ServerHmrVersion as NativeServerHmrVersion,
   LockfileError,
   LockfileResult,
+  NapiRemoveStaleOutputOptions,
+  NapiRemoveStaleOutputResult,
   projectCompilationEventsSubscribe,
   projectFeatureUsage,
   projectInvalidateFileSystemCache,
@@ -352,6 +354,19 @@ export interface Project {
    * @see {@link projectFeatureUsage}
    */
   featureUsage(): Promise<BuildFeatureUsage[]>
+
+  /**
+   * Removes the entries in the distDir that were not written by Turbopack in
+   * this session (stale output of previous builds), except for the `skip` and
+   * `keep` entries. Unchanged output files that were not rewritten count as
+   * written.
+   *
+   * Must only be called after `writeAllEntrypointsToDisk`, while no output is
+   * being written.
+   */
+  removeStaleOutput(
+    options: NapiRemoveStaleOutputOptions
+  ): Promise<NapiRemoveStaleOutputResult>
 
   entrypointsSubscribe(): AsyncIterableIterator<
     TurbopackResult<RawEntrypoints | {}>

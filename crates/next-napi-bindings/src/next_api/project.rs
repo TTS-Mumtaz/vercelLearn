@@ -65,8 +65,8 @@ use turbo_tasks_backend::{BackingStorageOptions, db_invalidation::invalidation_r
 #[cfg(windows)]
 use turbo_tasks_fs::windows::to_verbatim_with_case_folded_disk;
 use turbo_tasks_fs::{
-    DiskFileSystem, FileContent, FileSystem, FileSystemPath, canonicalize_to_rcstr, invalidation,
-    util::uri_from_file,
+    DiskFileSystem, FileContent, FileSystem, FileSystemPath, RemoveUnwrittenOptions,
+    canonicalize_to_rcstr, invalidation, util::uri_from_file,
 };
 use turbo_unix_path::{get_relative_path_to, unix_to_sys};
 use turbopack_core::{
@@ -2897,6 +2897,74 @@ pub async fn project_write_analyze_data(
     Ok(TurbopackResult {
         result: (),
         issues: issues.iter().map(|i| NapiIssue::from(&**i)).collect(),
+    })
+}
+
+#[turbo_tasks::function(operation, root)]
+fn project_output_fs_operation(container: ResolvedVc<ProjectContainer>) -> Vc<DiskFileSystem> {
+    container.project().output_fs()
+}
+
+#[turbo_tasks::function(operation, root)]
+fn project_node_root_operation(container: ResolvedVc<ProjectContainer>) -> Vc<FileSystemPath> {
+    container.project().node_root()
+}
+
+#[napi(object)]
+pub struct NapiRemoveStaleOutputOptions {
+    /// Paths relative to the dist dir, using `/` as separator, that are left untouched and are
+    /// not traversed.
+    pub skip: Vec<RcStr>,
+    /// Paths relative to the dist dir, using `/` as separator, of entries that were written
+    /// outside of Turbopack and must be kept. Kept directories are still traversed.
+    pub keep: Vec<RcStr>,
+}
+
+#[napi(object)]
+pub struct NapiRemoveStaleOutputResult {
+    pub removed_files: u32,
+    pub removed_directories: u32,
+}
+
+/// Removes the entries in the dist dir that were not written by Turbopack in this session, except
+/// the ones skipped or kept by `options`. Unchanged output files that were not rewritten because
+/// they already had the right content count as written.
+///
+/// Used by `next build` (instead of cleaning the dist dir upfront) after all entrypoints have been
+/// written. Must not be called while output is being written.
+#[tracing::instrument(level = "info", name = "remove stale output", skip_all)]
+#[napi]
+pub async fn project_remove_stale_output(
+    #[napi(ts_arg_type = "{ __napiType: \"Project\" }")] project: &External<ProjectInstance>,
+    options: NapiRemoveStaleOutputOptions,
+) -> napi::Result<NapiRemoveStaleOutputResult> {
+    let ctx = project.turbopack_ctx.clone();
+    let container = project.container;
+    let stats = ctx
+        .turbo_tasks()
+        .run_once(async move {
+            let output_fs = project_output_fs_operation(container)
+                .read_strongly_consistent()
+                .await?;
+            let node_root = project_node_root_operation(container)
+                .read_strongly_consistent()
+                .await?;
+            output_fs
+                .remove_entries_not_written_in_session(
+                    &node_root,
+                    RemoveUnwrittenOptions {
+                        skip: options.skip.into_iter().collect(),
+                        keep: options.keep.into_iter().collect(),
+                    },
+                )
+                .await
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(PrettyPrintError(&e).to_string()))?;
+
+    Ok(NapiRemoveStaleOutputResult {
+        removed_files: stats.removed_files.try_into().unwrap_or(u32::MAX),
+        removed_directories: stats.removed_directories.try_into().unwrap_or(u32::MAX),
     })
 }
 

@@ -139,6 +139,21 @@ impl EffectStateStorage {
         )
     }
 
+    /// Returns the `value_hash` of the effect that was last successfully applied for `key`, or
+    /// `None` if no effect has been successfully applied for `key` (yet).
+    ///
+    /// This doesn't allocate and doesn't create an entry for `key`.
+    pub fn applied_value_hash(&self, key: &[u8]) -> Option<u128> {
+        let entry = self.effect_state.lock().get(key).cloned()?;
+        match &*entry.lock() {
+            EffectLastApplied::Applied {
+                value_hash,
+                result: Ok(()),
+            } => Some(*value_hash),
+            _ => None,
+        }
+    }
+
     /// Look up or create the per-key state entry.
     fn entry_for(&self, key: Box<[u8]>) -> EffectStateEntry {
         self.effect_state

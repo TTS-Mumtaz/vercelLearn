@@ -44,6 +44,9 @@ use crate::{
     invalidator_map::InvalidatorMap,
     mutex_map::MutexMap,
     path_map::OrderedPathMapExt,
+    remove_unwritten::{
+        RemoveUnwrittenOptions, RemoveUnwrittenStats, remove_entries_not_written_in_session,
+    },
     retry::{can_retry, retry_blocking, retry_blocking_custom},
     watcher::{DiskWatcher, DiskWatcherConfig},
 };
@@ -566,6 +569,44 @@ impl DiskFileSystem {
 
     pub fn invalidate(&self) {
         self.inner.invalidate();
+    }
+
+    /// Returns whether a file or link at `sys_path` was written by this filesystem in the current
+    /// session, i.e. a write effect for it has been successfully applied. This includes writes that
+    /// were skipped because the file on disk already had the same content. Writes that removed the
+    /// file don't count.
+    ///
+    /// `sys_path` must be in the same format as returned by [`Self::to_sys_path_raw`].
+    ///
+    /// This reuses the per-path state the filesystem keeps for applied effects anyways, so it
+    /// doesn't require any additional memory.
+    pub fn was_written_in_session(&self, sys_path: &Path) -> bool {
+        static NOT_FOUND_HASH: LazyLock<u128> =
+            LazyLock::new(|| hash_xxh3_hash128(&PersistedFileContent::NotFound));
+        self.inner
+            .effect_state_storage
+            .applied_value_hash(sys_path.as_os_str().as_encoded_bytes())
+            .is_some_and(|value_hash| value_hash != *NOT_FOUND_HASH)
+    }
+
+    /// Removes all files, symlinks, and (then empty) directories inside of `dir` that were not
+    /// written by this filesystem in the current session (see [`Self::was_written_in_session`]),
+    /// except for the entries skipped or kept by `options`. `dir` itself is never removed.
+    ///
+    /// This can be used to remove stale files from a previous session in an output directory,
+    /// after all output has been written, without deleting (and rewriting) the files that are
+    /// unchanged.
+    ///
+    /// Must only be called while no writes to `dir` are in progress.
+    pub async fn remove_entries_not_written_in_session(
+        &self,
+        dir: &FileSystemPath,
+        options: RemoveUnwrittenOptions,
+    ) -> Result<RemoveUnwrittenStats> {
+        let dir = self.to_sys_path_raw(dir);
+        remove_entries_not_written_in_session(self.clone(), dir, options)
+            .instrument(tracing::info_span!("remove entries not written in session"))
+            .await
     }
 
     pub fn invalidate_with_reason<R: InvalidationReason + Clone>(

@@ -19,6 +19,8 @@ import type {
   NapiSourceDiagnostic,
   NapiCodeFrameLocation,
   NapiCodeFrameOptions,
+  NapiRemoveStaleOutputOptions as RemoveStaleOutputOptions,
+  NapiRemoveStaleOutputResult as RemoveStaleOutputResult,
 } from './generated-native'
 import type {
   Binding,
@@ -750,6 +752,12 @@ function bindingToApi(
       return (await binding.projectFeatureUsage(
         this._nativeProject
       )) as BuildFeatureUsage[]
+    }
+
+    async removeStaleOutput(
+      options: RemoveStaleOutputOptions
+    ): Promise<RemoveStaleOutputResult> {
+      return binding.projectRemoveStaleOutput(this._nativeProject, options)
     }
 
     entrypointsSubscribe() {

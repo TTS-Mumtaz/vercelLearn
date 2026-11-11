@@ -462,6 +462,24 @@ export interface NapiProjectOptions {
   ensureShallowSourceMaps?: boolean
 }
 
+export interface NapiRemoveStaleOutputOptions {
+  /**
+   * Paths relative to the dist dir, using `/` as separator, that are left untouched and are
+   * not traversed.
+   */
+  skip: Array<RcStr>
+  /**
+   * Paths relative to the dist dir, using `/` as separator, of entries that were written
+   * outside of Turbopack and must be kept. Kept directories are still traversed.
+   */
+  keep: Array<RcStr>
+}
+
+export interface NapiRemoveStaleOutputResult {
+  removedFiles: number
+  removedDirectories: number
+}
+
 /** Keep in sync with [`next_core::next_config::Rewrite`] */
 export interface NapiRewrite {
   source: string
@@ -698,6 +716,19 @@ export declare function projectNew(
 export declare function projectOnExit(project: {
   __napiType: 'Project'
 }): Promise<void>
+
+/**
+ * Removes the entries in the dist dir that were not written by Turbopack in this session, except
+ * the ones skipped or kept by `options`. Unchanged output files that were not rewritten because
+ * they already had the right content count as written.
+ *
+ * Used by `next build` (instead of cleaning the dist dir upfront) after all entrypoints have been
+ * written. Must not be called while output is being written.
+ */
+export declare function projectRemoveStaleOutput(
+  project: { __napiType: 'Project' },
+  options: NapiRemoveStaleOutputOptions
+): Promise<NapiRemoveStaleOutputResult>
 
 /**
  * Runs resource cleanup, stops Turbo Tasks, and then flushes the project's exit handlers.
