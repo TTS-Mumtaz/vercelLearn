@@ -244,6 +244,7 @@ import {
   ReplayableNodeStream,
   createReactServerPrerenderResultFromRender,
 } from './app-render-prerender-utils'
+import { signalForReact } from './react-abort-signal'
 import {
   Phase,
   printDebugThrownValueForProspectiveRender,
@@ -9483,7 +9484,7 @@ async function prerenderToStream(
         // We don't want to stop rendering until the cacheSignal is complete so we pass
         // a different signal to this render call than is used by dynamic APIs to signify
         // transitioning out of the prerender environment
-        signal: initialServerReactController.signal,
+        signal: signalForReact(initialServerReactController.signal),
       }
 
       const pendingInitialServerResult = workUnitAsyncStorage.run(
@@ -9589,7 +9590,7 @@ async function prerenderToStream(
             images={ctx.renderOpts.images}
           />,
           {
-            signal: initialClientReactController.signal,
+            signal: signalForReact(initialClientReactController.signal),
             onError: (err: unknown) => {
               const digest = getDigestForWellKnownError(err)
 
@@ -9857,7 +9858,7 @@ async function prerenderToStream(
               onError: (err: unknown) => {
                 return serverComponentsErrorHandler(err)
               },
-              signal: finalServerReactController.signal,
+              signal: signalForReact(finalServerReactController.signal),
             }
           )
 
@@ -10065,7 +10066,7 @@ async function prerenderToStream(
                 images={ctx.renderOpts.images}
               />,
               {
-                signal: finalClientReactController.signal,
+                signal: signalForReact(finalClientReactController.signal),
                 onError: (err: unknown, errorInfo: ErrorInfo) => {
                   if (
                     isPrerenderInterruptedError(err) ||
