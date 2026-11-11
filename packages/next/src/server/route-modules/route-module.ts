@@ -169,6 +169,27 @@ export abstract class RouteModule<
   public incrementCache?: IncrementalCache
   public responseCache?: ResponseCache
 
+  /**
+   * The directories `ensureInstrumentation` resolved for the previous call,
+   * with the values they were resolved from.
+   */
+  private resolvedDirs:
+    | {
+        cwd: string
+        relativeProjectDir: string
+        absoluteDistDir: string | undefined
+        absoluteProjectDir: string
+        distDir: string | undefined
+      }
+    | undefined = undefined
+
+  /** The server utils of the previous request, with the inputs they were created from. */
+  private previousServerUtils:
+    | (Parameters<typeof getServerUtils>[0] & {
+        serverUtils: ReturnType<typeof getServerUtils>
+      })
+    | undefined = undefined
+
   constructor({
     userland,
     definition,
@@ -776,16 +797,43 @@ export abstract class RouteModule<
       const { join, relative } =
         require('node:path') as typeof import('node:path')
 
-      absoluteProjectDir = join(
-        /* turbopackIgnore: true */
-        process.cwd(),
+      // This runs twice for every request. The directories are almost always
+      // those of the previous call, so only resolve them when they changed.
+      const cwd = process.cwd()
+      const relativeProjectDir =
         getRequestMeta(req, 'relativeProjectDir') || this.relativeProjectDir
-      )
-
       const absoluteDistDir = getRequestMeta(req, 'distDir')
+      const resolved = this.resolvedDirs
 
-      if (absoluteDistDir) {
-        this.distDir = relative(absoluteProjectDir, absoluteDistDir)
+      if (
+        resolved !== undefined &&
+        resolved.cwd === cwd &&
+        resolved.relativeProjectDir === relativeProjectDir &&
+        resolved.absoluteDistDir === absoluteDistDir
+      ) {
+        absoluteProjectDir = resolved.absoluteProjectDir
+        if (resolved.distDir !== undefined) {
+          this.distDir = resolved.distDir
+        }
+      } else {
+        absoluteProjectDir = join(
+          /* turbopackIgnore: true */
+          cwd,
+          relativeProjectDir
+        )
+
+        let distDir: string | undefined
+        if (absoluteDistDir) {
+          distDir = relative(absoluteProjectDir, absoluteDistDir)
+          this.distDir = distDir
+        }
+        this.resolvedDirs = {
+          cwd,
+          relativeProjectDir,
+          absoluteDistDir,
+          absoluteProjectDir,
+          distDir,
+        }
       }
       const {
         ensureInstrumentationRegistered,
@@ -948,15 +996,47 @@ export abstract class RouteModule<
     // the pathname format (e.g., /app/[slug]).
     const normalizedSrcPage = normalizeAppPath(srcPage)
 
-    const serverUtils = getServerUtils({
-      page: normalizedSrcPage,
-      i18n: isPagesRoute ? i18n : undefined,
-      basePath,
-      rewrites,
-      pageIsDynamic,
-      trailingSlash: process.env.__NEXT_TRAILING_SLASH as any as boolean,
-      caseSensitive: Boolean(routesManifest.caseSensitive),
-    })
+    // The server utils only depend on the page and on values from the routes
+    // manifest. Creating them compiles the route regex of a dynamic route, so
+    // reuse those of the previous request while the inputs are the same.
+    // Outside of development the manifest is loaded once, so they always are.
+    const serverUtilsI18n = isPagesRoute ? i18n : undefined
+    const trailingSlash = process.env.__NEXT_TRAILING_SLASH as any as boolean
+    const caseSensitive = Boolean(routesManifest.caseSensitive)
+    const previousServerUtils = this.previousServerUtils
+    let serverUtils: ReturnType<typeof getServerUtils>
+    if (
+      previousServerUtils !== undefined &&
+      previousServerUtils.page === normalizedSrcPage &&
+      previousServerUtils.i18n === serverUtilsI18n &&
+      previousServerUtils.basePath === basePath &&
+      previousServerUtils.rewrites === rewrites &&
+      previousServerUtils.pageIsDynamic === pageIsDynamic &&
+      previousServerUtils.trailingSlash === trailingSlash &&
+      previousServerUtils.caseSensitive === caseSensitive
+    ) {
+      serverUtils = previousServerUtils.serverUtils
+    } else {
+      serverUtils = getServerUtils({
+        page: normalizedSrcPage,
+        i18n: serverUtilsI18n,
+        basePath,
+        rewrites,
+        pageIsDynamic,
+        trailingSlash,
+        caseSensitive,
+      })
+      this.previousServerUtils = {
+        page: normalizedSrcPage,
+        i18n: serverUtilsI18n,
+        basePath,
+        rewrites,
+        pageIsDynamic,
+        trailingSlash,
+        caseSensitive,
+        serverUtils,
+      }
+    }
 
     const domainLocale = detectDomainLocale(
       i18n?.domains,
